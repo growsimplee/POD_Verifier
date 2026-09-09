@@ -23,3 +23,7 @@ aws/lambda_scorer/.venv/
 **/.pytest_cache/
 aws/eval/eval_out/
 aws/eval/_gold_images_tmp/
+
+# Staged into the Docker build context by aws/deploy.sh from
+# aws/infra/schema.sql — generated, never edited by hand.
+aws/lambda_scorer/schema.sql

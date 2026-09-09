@@ -1,9 +1,10 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  POD pipeline — VPC Lambda (container image) triggered once daily by EventBridge
-  Scheduler. Single invocation: read POD rows from Postgres, download images to
-  memory, score with EfficientNet, upsert to Postgres; resume + bounded
-  self-continuation. No SAM. Deploy with aws/provision-stack.sh.
+  POD pipeline — VPC Lambda (container image). Primary trigger is event-driven:
+  Sarathy invokes it asynchronously with {"trip_id": N} when a rider raises a
+  POD verification request, and only that trip's images are scored. The daily
+  EventBridge schedule is kept but DISABLED, for backfills / manual whole-dataset
+  re-runs. No SAM. Deploy with aws/provision-stack.sh.
 
 Parameters:
   Stage:
@@ -14,9 +15,75 @@ Parameters:
   SourceQuery:
     Type: String
     Description: >
-      SQL run against Postgres to read the day's POD rows. Must return an AWB
-      column, a trip-id column, and a POD-links column (POD / pod / pod_link;
-      comma-separated links are expanded).
+      Backfill/batch only. SQL run against Postgres to read the day's POD rows.
+      Must return an AWB column, a trip-id column, and a POD-links column
+      (POD / pod / pod_link; comma-separated links are expanded).
+
+  TripQuery:
+    Type: String
+    Default: "SELECT awb, trip_id, pod FROM pod_manual_verification WHERE trip_id = %(trip_id)s"
+    Description: >
+      Single-trip (event-driven) query. Same column contract as SourceQuery, and
+      MUST keep the named %(trip_id)s placeholder — it is bound as a query
+      parameter, never string-interpolated. If it returns no rows the handler
+      falls back to the pod_links carried in the trigger event.
+
+  RangeQuery:
+    Type: String
+    Default: "SELECT awb, trip_id, pod FROM pod_manual_verification WHERE created_date BETWEEN %(start_date)s AND %(end_date)s"
+    Description: >
+      Backfill by date range, used when the trigger event carries start_date /
+      end_date. MUST keep the named %(start_date)s and %(end_date)s placeholders —
+      they are bound as query parameters, never string-interpolated.
+
+  AllowAdhocQuery:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Allow a trigger event to carry raw SQL. It is validated as a single
+      read-only SELECT/WITH before it reaches Postgres; set false to refuse
+      ad-hoc SQL entirely.
+
+  RescoreLookbackDays:
+    Type: Number
+    Default: 30
+    Description: >
+      A POD link already scored within this many days is not re-downloaded when
+      a rider re-raises a request. Keyed on the link, so replaced photos are
+      always scored. 0 = never re-score a link.
+
+  TripMaxDownloadWorkers:
+    Type: String
+    Default: "8"
+    Description: Download threads for a single-trip run (a trip has few images)
+
+  WarmPoolSize:
+    Type: Number
+    Default: 3
+    Description: >
+      Containers kept hot by the warmup schedule. 0 disables the warmer — set it
+      to roughly the number of trips you expect to be scored concurrently.
+
+  WarmupRate:
+    Type: String
+    Default: "rate(5 minutes)"
+    Description: How often to ping the warm pool (Lambda reaps idle containers)
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 180, 365, 731, 1827, 3653]
+    Description: >
+      CloudWatch retention for the function's logs. Without an explicit log
+      group Lambda creates one that never expires.
+
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: >
+      Optional address subscribed to the alarm topic. Leave empty to create the
+      topic with no subscription and wire it up later.
 
   FlagThreshold:
     Type: String
@@ -76,6 +143,28 @@ Parameters:
     Type: Number
     Default: 512
 
+  ReservedConcurrency:
+    Type: Number
+    Default: 10
+    Description: >
+      Per-trip events arrive whenever riders request verification, so this is
+      sized for concurrent trips rather than a single daily run. Also caps load
+      on the source host and the DB. Must exceed WarmPoolSize, since warm pings
+      hold slots too — leave headroom for batch runs and continuations.
+
+  InvokerPrincipalArns:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >
+      Optional IAM principal ARNs (e.g. the Sarathy service role/user) granted
+      lambda:InvokeFunction on this function. Leave empty if the caller's own
+      IAM policy already allows it.
+
+Conditions:
+  HasInvokerPrincipal: !Not [!Equals [!Join ["", !Ref InvokerPrincipalArns], ""]]
+  WarmPoolEnabled: !Not [!Equals [!Ref WarmPoolSize, 0]]
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+
 Resources:
 
   LambdaSecurityGroup:
@@ -117,10 +206,21 @@ Resources:
                 Action: sqs:SendMessage
                 Resource: !GetAtt PipelineDLQ.Arn
 
+  # Owned explicitly so retention is set. Left implicit, Lambda creates this log
+  # group on first invoke with never-expire retention and CFN never deletes it.
+  PodPipelineLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/pod-pipeline-${Stage}
+      RetentionInDays: !Ref LogRetentionDays
+
   PodPipelineFunction:
     Type: AWS::Lambda::Function
     DependsOn:
       - LambdaExecutionRole
+      - PodPipelineLogGroup
     Properties:
       FunctionName: !Sub pod-pipeline-${Stage}
       PackageType: Image
@@ -129,7 +229,7 @@ Resources:
         ImageUri: !Ref ScorerImageUri
       MemorySize: 10240          # ~6 vCPU — CPU is bought with memory
       Timeout: 900
-      ReservedConcurrentExecutions: 3   # daily run + retry/continuation headroom
+      ReservedConcurrentExecutions: !Ref ReservedConcurrency
       DeadLetterConfig:
         TargetArn: !GetAtt PipelineDLQ.Arn
       EphemeralStorage:
@@ -143,6 +243,12 @@ Resources:
       Environment:
         Variables:
           SOURCE_QUERY: !Ref SourceQuery
+          TRIP_QUERY: !Ref TripQuery
+          RANGE_QUERY: !Ref RangeQuery
+          ALLOW_ADHOC_QUERY: !Ref AllowAdhocQuery
+          RESCORE_LOOKBACK_DAYS: !Ref RescoreLookbackDays
+          TRIP_MAX_DOWNLOAD_WORKERS: !Ref TripMaxDownloadWorkers
+          WARM_FANOUT: !Ref WarmPoolSize
           FLAG_THRESHOLD: !Ref FlagThreshold
           MAX_DOWNLOAD_WORKERS: !Ref MaxDownloadWorkers
           WINDOW_SIZE: !Ref WindowSize
@@ -174,6 +280,15 @@ Resources:
       QueueName: !Sub pod-pipeline-dlq-${Stage}
       MessageRetentionPeriod: 1209600   # 14 days
 
+  # Lets Sarathy (or any listed principal) invoke this function directly.
+  SarathyInvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasInvokerPrincipal
+    Properties:
+      FunctionName: !Ref PodPipelineFunction
+      Action: lambda:InvokeFunction
+      Principal: !Select [0, !Ref InvokerPrincipalArns]
+
   SchedulerInvokeLambdaPermission:
     Type: AWS::Lambda::Permission
     Properties:
@@ -201,11 +316,39 @@ Resources:
                 Action: lambda:InvokeFunction
                 Resource: !GetAtt PodPipelineFunction.Arn
 
+  # Keeps WarmPoolSize containers hot. A cold container pays for the image pull,
+  # the torch import and the checkpoint load; riders trigger scoring at
+  # unpredictable times, so we pay that on a schedule instead of on the request.
+  # This is the cheap option — for a hard latency floor use provisioned
+  # concurrency on an alias instead (see aws/README.md).
+  WarmupSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: WarmPoolEnabled
+    Properties:
+      Name: !Sub pod-scoring-warmup-${Stage}
+      Description: Keep the POD scorer warm so rider-triggered scoring skips the cold start
+      State: ENABLED
+      ScheduleExpression: !Ref WarmupRate
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt PodPipelineFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub '{"warmup": true, "fanout": ${WarmPoolSize}}'
+        RetryPolicy:
+          MaximumRetryAttempts: 0
+
+  # Kept for backfills / manual whole-dataset re-runs, but DISABLED: scoring is
+  # now driven per trip by Sarathy's POD verification request. Re-enable with
+  # `aws scheduler update-schedule --name pod-scoring-daily-<stage> --state ENABLED`
+  # (or flip State below) if a batch sweep is ever needed again.
   DailySchedule:
     Type: AWS::Scheduler::Schedule
     Properties:
       Name: !Sub pod-scoring-daily-${Stage}
-      Description: Trigger POD pipeline (single invocation, whole dataset) 23:55 IST (18:25 UTC)
+      Description: Backfill sweep (whole dataset). DISABLED — per-trip events are the live trigger.
+      State: DISABLED
       ScheduleExpression: cron(25 18 * * ? *)
       ScheduleExpressionTimezone: UTC
       FlexibleTimeWindow:
@@ -218,6 +361,103 @@ Resources:
           MaximumRetryAttempts: 2
           MaximumEventAgeInSeconds: 3600
 
+  # ----------------------------------------------------------------------- #
+  # Alerting. The pipeline already emits the signals; without these nobody is
+  # subscribed to them.
+  # ----------------------------------------------------------------------- #
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub pod-pipeline-alarms-${Stage}
+      DisplayName: !Sub POD pipeline alarms (${Stage})
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  # Scoring failed outright — an unhandled exception, or async retries running out.
+  FunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub pod-pipeline-errors-${Stage}
+      AlarmDescription: The scorer raised errors — trips are not being scored.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PodPipelineFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # The warm pool and live per-trip events share ReservedConcurrentExecutions.
+  # Throttles mean that ceiling is now dropping real work.
+  FunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub pod-pipeline-throttles-${Stage}
+      AlarmDescription: >
+        Invocations are being throttled — raise ReservedConcurrency or lower
+        WarmPoolSize.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PodPipelineFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # Anything here has exhausted its retries and will never be scored on its own.
+  DlqDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub pod-pipeline-dlq-${Stage}
+      AlarmDescription: Events landed in the dead-letter queue and need replaying.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt PipelineDLQ.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # A batch run gave up with images neither scored nor recorded as failed.
+  UncoveredImagesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub pod-pipeline-uncovered-${Stage}
+      AlarmDescription: >
+        A batch run ended with images left uncovered — it ran out of
+        continuations before finishing.
+      Namespace: PODPipeline
+      MetricName: ImagesUncovered
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
 Outputs:
   PodPipelineFunctionArn:
     Value: !GetAtt PodPipelineFunction.Arn
@@ -227,3 +467,9 @@ Outputs:
     Value: !Ref DailySchedule
   ScheduleArn:
     Value: !GetAtt DailySchedule.Arn
+  AlarmTopicArn:
+    Value: !Ref AlarmTopic
+  DeadLetterQueueUrl:
+    Value: !Ref PipelineDLQ
+  LogGroupName:
+    Value: !Ref PodPipelineLogGroup

@@ -61,27 +61,40 @@ class FakeSession:
 class FakeCursor:
     def __init__(self, conn):
         self.conn = conn
+        self._rows = []
     def __enter__(self):
         return self
     def __exit__(self, *a):
         return False
     def execute(self, sql, params=None):
         self.conn._last_sql = sql
+        self.conn.executed.append((sql, params))
+        if "SELECT pod_link FROM pod_scores" in sql:
+            # load_scored_links: only links this trip already scored
+            links = set(params["links"]) if params else set()
+            self._rows = [(l,) for l in self.conn.scored_links if l in links]
+        elif sql.strip() == "SELECT 1":
+            self._rows = [(1,)]
+        else:
+            self._rows = list(self.conn.done_rows)
     def fetchall(self):
-        return list(self.conn.done_rows)
+        return list(self._rows)
 
 
 class FakeConn:
-    def __init__(self, done_rows=None):
+    def __init__(self, done_rows=None, scored_links=()):
         self.done_rows = done_rows or []
+        self.scored_links = set(scored_links)
         self.upserted = []
+        self.executed = []
         self.committed = 0
+        self.closed = 0
     def cursor(self):
         return FakeCursor(self)
     def commit(self):
         self.committed += 1
     def close(self):
-        pass
+        self.closed = 1
 
 
 class FakeContext:
@@ -106,8 +119,13 @@ def _fake_score_prepared(model, device, successes):
 @pytest.fixture
 def wire(monkeypatch):
     conn = FakeConn()
+    # Warm-container caches are module globals — clear them so tests are isolated.
+    monkeypatch.setattr(H, "_model", None, raising=False)
+    monkeypatch.setattr(H, "_session", None, raising=False)
+    monkeypatch.setattr(H, "_conn", None, raising=False)
     monkeypatch.setattr(H, "get_model", lambda: (object(), "cpu"))
     monkeypatch.setattr(H, "get_db_connection", lambda: conn)
+    monkeypatch.setattr(H, "release_db_connection", lambda c: None)
     monkeypatch.setattr(H, "score_prepared", _fake_score_prepared)
     monkeypatch.setattr(H, "emit_coverage", lambda *a, **k: None)
 
@@ -199,8 +217,8 @@ def test_load_done_keys():
 
 def test_handler_covers_whole_dataset_one_invocation(wire, monkeypatch):
     N = 2500
-    monkeypatch.setattr(H, "fetch_pod_data", lambda: _mb_df(N))
-    monkeypatch.setattr(H, "build_session", lambda: FakeSession())
+    monkeypatch.setattr(H, "fetch_pod_data", lambda sql=None, params=None: _mb_df(N))
+    monkeypatch.setattr(H, "build_session", lambda *a, **k: FakeSession())
     monkeypatch.setattr(H, "WINDOW_SIZE", 800, raising=False)
 
     resp = H.handler({}, FakeContext(600_000))
@@ -215,7 +233,7 @@ def test_handler_covers_whole_dataset_one_invocation(wire, monkeypatch):
 def test_handler_records_failures_as_outcomes(wire, monkeypatch):
     N = 100
     fail = {f"http://img/{i}.png" for i in (5, 10, 42)}
-    monkeypatch.setattr(H, "fetch_pod_data", lambda: _mb_df(N))
+    monkeypatch.setattr(H, "fetch_pod_data", lambda sql=None, params=None: _mb_df(N))
     monkeypatch.setattr(H, "build_session", lambda: FakeSession(fail_urls=fail))
     resp = H.handler({}, FakeContext(600_000))
     body = json.loads(resp["body"])
@@ -227,8 +245,8 @@ def test_handler_records_failures_as_outcomes(wire, monkeypatch):
 
 def test_handler_resume_skips_done(wire, monkeypatch):
     N = 50
-    monkeypatch.setattr(H, "fetch_pod_data", lambda: _mb_df(N))
-    monkeypatch.setattr(H, "build_session", lambda: FakeSession())
+    monkeypatch.setattr(H, "fetch_pod_data", lambda sql=None, params=None: _mb_df(N))
+    monkeypatch.setattr(H, "build_session", lambda *a, **k: FakeSession())
     done = {(f"AWB{i}", f"http://img/{i}.png") for i in range(20)}
     monkeypatch.setattr(H, "load_done_keys", lambda c, d: done)
     resp = H.handler({}, FakeContext(600_000))
@@ -240,13 +258,13 @@ def test_handler_resume_skips_done(wire, monkeypatch):
 
 def test_handler_continuation_near_wall(wire, monkeypatch):
     N = 3000
-    monkeypatch.setattr(H, "fetch_pod_data", lambda: _mb_df(N))
-    monkeypatch.setattr(H, "build_session", lambda: FakeSession())
+    monkeypatch.setattr(H, "fetch_pod_data", lambda sql=None, params=None: _mb_df(N))
+    monkeypatch.setattr(H, "build_session", lambda *a, **k: FakeSession())
     monkeypatch.setattr(H, "WINDOW_SIZE", 500, raising=False)
     monkeypatch.setattr(H, "CONTINUATION_SAFETY_MS", 90_000, raising=False)
     called = {}
     monkeypatch.setattr(H, "invoke_continuation",
-                        lambda rid, rd, c: called.update(run_id=rid, cont=c))
+                        lambda rid, rd, c, sel=None: called.update(run_id=rid, cont=c))
 
     class Ctx:
         def __init__(self):
@@ -283,3 +301,431 @@ def test_score_prepared_real_math():
     assert len(out) == 3
     assert abs(out[0]["pod_score"] - 0.5) < 1e-6
     assert abs(out[0]["context_valid_prob"] - 0.5) < 1e-6
+
+
+# --------------------------------------------------------------------------- #
+# Single-trip (event-driven) mode
+# --------------------------------------------------------------------------- #
+
+def _trip_df(trip_id="T99", n=2):
+    return pd.DataFrame([
+        {"awb": f"AWB{i}", "trip_id": trip_id,
+         "pod": f"http://img/{trip_id}_{i}.png"}
+        for i in range(n)
+    ])
+
+
+def test_normalise_event_unwraps_envelopes():
+    assert H._normalise_event({"trip_id": 5})["trip_id"] == 5
+    assert H._normalise_event('{"trip_id": 5}')["trip_id"] == 5
+    assert H._normalise_event({"detail": {"trip_id": 5}})["trip_id"] == 5
+    assert H._normalise_event(
+        {"Records": [{"body": json.dumps({"trip_id": 5})}]})["trip_id"] == 5
+    assert H._normalise_event(None) == {}
+    assert H._normalise_event({}) == {}
+
+
+def test_trip_event_routes_to_single_trip(wire, monkeypatch):
+    called = {}
+    monkeypatch.setattr(H, "handle_single_trip",
+                        lambda e, c: called.setdefault("trip", e["trip_id"]))
+    monkeypatch.setattr(H, "handle_batch",
+                        lambda e, c: called.setdefault("batch", True))
+    H.handler({"trip_id": 4242}, FakeContext(900_000))
+    assert called == {"trip": 4242}
+
+
+def test_empty_event_still_routes_to_batch(wire, monkeypatch):
+    called = {}
+    monkeypatch.setattr(H, "handle_batch", lambda e, c: called.setdefault("batch", True))
+    H.handler({}, FakeContext(900_000))
+    assert called == {"batch": True}
+
+
+def test_single_trip_scores_only_that_trip(wire, monkeypatch):
+    monkeypatch.setattr(H, "fetch_trip_pod_data", lambda tid: _trip_df("T99", 3))
+    monkeypatch.setattr(H, "build_session", lambda *a, **k: FakeSession())
+
+    resp = H.handler({"trip_id": "T99"}, FakeContext(900_000))
+    body = json.loads(resp["body"])
+
+    assert resp["statusCode"] == 200
+    assert body["mode"] == "single_trip"
+    assert body["source"] == "trip_query"
+    assert body["trip_id"] == "T99"
+    assert body["total_images"] == 3
+    assert body["scored"] == 3 and body["failed"] == 0
+    # every upserted row is bound to the triggering trip — no other trip touched
+    assert {r["trip_id"] for r in wire.upserted} == {"T99"}
+    assert len(wire.upserted) == 3
+
+
+def test_single_trip_falls_back_to_event_links(wire, monkeypatch):
+    monkeypatch.setattr(H, "fetch_trip_pod_data", lambda tid: pd.DataFrame())
+    monkeypatch.setattr(H, "build_session", lambda *a, **k: FakeSession())
+
+    body = json.loads(H.handler({
+        "trip_id": 77,
+        "awb": "AWB-77",
+        "pod_links": ["http://img/a.png", "http://img/a.png", "http://img/b.png", "junk"],
+    }, FakeContext(900_000))["body"])
+
+    assert body["source"] == "event_payload"
+    assert body["total_images"] == 2          # deduped, non-http dropped
+    assert {r["awb"] for r in wire.upserted} == {"AWB-77"}
+
+
+def test_single_trip_falls_back_when_trip_query_errors(wire, monkeypatch):
+    def _boom(tid):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(H, "fetch_trip_pod_data", _boom)
+    monkeypatch.setattr(H, "build_session", lambda *a, **k: FakeSession())
+
+    body = json.loads(H.handler({
+        "trip_id": 77, "pod_links": ["http://img/a.png"],
+    }, FakeContext(900_000))["body"])
+
+    assert body["source"] == "event_payload"
+    assert body["scored"] == 1
+
+
+def test_single_trip_without_awb_uses_trip_placeholder(wire, monkeypatch):
+    monkeypatch.setattr(H, "fetch_trip_pod_data", lambda tid: pd.DataFrame())
+    monkeypatch.setattr(H, "build_session", lambda *a, **k: FakeSession())
+
+    H.handler({"trip_id": 77, "pod_links": ["http://img/a.png"]}, FakeContext(900_000))
+    assert {r["awb"] for r in wire.upserted} == {"TRIP-77"}
+
+
+def test_single_trip_no_links_is_a_clean_no_op(wire, monkeypatch):
+    monkeypatch.setattr(H, "fetch_trip_pod_data", lambda tid: pd.DataFrame())
+    monkeypatch.setattr(H, "build_session", lambda *a, **k: FakeSession())
+
+    resp = H.handler({"trip_id": 77}, FakeContext(900_000))
+    body = json.loads(resp["body"])
+
+    assert resp["statusCode"] == 200
+    assert body["status"] == "no_data"
+    assert wire.upserted == []
+
+
+def test_single_trip_records_download_failures(wire, monkeypatch):
+    monkeypatch.setattr(H, "fetch_trip_pod_data", lambda tid: _trip_df("T5", 2))
+    monkeypatch.setattr(H, "build_session",
+                        lambda *a, **k: FakeSession(fail_urls={"http://img/T5_1.png"}))
+
+    body = json.loads(H.handler({"trip_id": "T5"}, FakeContext(900_000))["body"])
+
+    assert body["scored"] == 1 and body["failed"] == 1
+    assert len(wire.upserted) == 2            # every input still gets an outcome
+    assert {r["status"] for r in wire.upserted} == {"scored", "download_failed"}
+
+
+# --------------------------------------------------------------------------- #
+# Re-requests for the same trip
+# --------------------------------------------------------------------------- #
+
+def test_repeat_request_skips_links_already_scored(wire, monkeypatch):
+    monkeypatch.setattr(H, "fetch_trip_pod_data", lambda tid: _trip_df("T7", 2))
+    monkeypatch.setattr(H, "build_session", lambda *a, **k: FakeSession())
+
+    first = json.loads(H.handler({"trip_id": "T7"}, FakeContext(900_000))["body"])
+    assert first["scored"] == 2
+    # the DB now holds those two links as scored
+    wire.scored_links |= {r["pod_link"] for r in wire.upserted}
+    wire.upserted.clear()
+
+    second = json.loads(H.handler({"trip_id": "T7"}, FakeContext(900_000))["body"])
+    assert second["status"] == "already_scored"
+    assert second["scored"] == 0
+    assert second["skipped_already_scored"] == 2
+    assert wire.upserted == []                # nothing re-downloaded, nothing re-written
+
+
+def test_repeat_request_scores_only_the_changed_links(wire, monkeypatch):
+    """The rider replaced one photo — score that one, leave the other alone."""
+    monkeypatch.setattr(H, "build_session", lambda *a, **k: FakeSession())
+    monkeypatch.setattr(H, "fetch_trip_pod_data", lambda tid: pd.DataFrame([
+        {"awb": "A1", "trip_id": "T8", "pod": "http://img/old.png"},
+        {"awb": "A2", "trip_id": "T8", "pod": "http://img/new.png"},
+    ]))
+    wire.scored_links = {"http://img/old.png"}
+
+    body = json.loads(H.handler({"trip_id": "T8"}, FakeContext(900_000))["body"])
+
+    assert body["total_images"] == 2
+    assert body["skipped_already_scored"] == 1
+    assert body["scored"] == 1
+    assert [r["pod_link"] for r in wire.upserted] == ["http://img/new.png"]
+
+
+def test_scored_links_lookup_is_scoped_to_the_trip(wire, monkeypatch):
+    monkeypatch.setattr(H, "fetch_trip_pod_data", lambda tid: _trip_df("T9", 1))
+    monkeypatch.setattr(H, "build_session", lambda *a, **k: FakeSession())
+
+    H.handler({"trip_id": "T9"}, FakeContext(900_000))
+    lookup = [(sql, prm) for sql, prm in wire.executed
+              if "SELECT pod_link FROM pod_scores" in sql]
+    assert lookup, "expected an already-scored lookup"
+    sql, params = lookup[0]
+    assert params["trip_id"] == "T9"
+    assert "status = 'scored'" in sql
+    assert "run_date >=" in sql               # bounded by RESCORE_LOOKBACK_DAYS
+
+
+def test_rescore_lookback_zero_looks_back_forever(wire, monkeypatch):
+    monkeypatch.setattr(H, "RESCORE_LOOKBACK_DAYS", 0, raising=False)
+    monkeypatch.setattr(H, "fetch_trip_pod_data", lambda tid: _trip_df("TA", 1))
+    monkeypatch.setattr(H, "build_session", lambda *a, **k: FakeSession())
+
+    H.handler({"trip_id": "TA"}, FakeContext(900_000))
+    sql = [s for s, _ in wire.executed if "SELECT pod_link FROM pod_scores" in s][0]
+    assert "run_date >=" not in sql
+
+
+# --------------------------------------------------------------------------- #
+# Warm pool
+# --------------------------------------------------------------------------- #
+
+def test_warmup_loads_the_model_and_does_not_score(wire, monkeypatch):
+    loaded = {"n": 0}
+    monkeypatch.setattr(H, "get_model", lambda: (loaded.__setitem__("n", loaded["n"] + 1), (object(), "cpu"))[1])
+    monkeypatch.setattr(H, "build_session", lambda *a, **k: FakeSession())
+    monkeypatch.setattr(H, "WARM_FANOUT", 1, raising=False)
+
+    body = json.loads(H.handler({"warmup": True}, FakeContext(900_000))["body"])
+
+    assert body["status"] == "warm"
+    assert loaded["n"] == 1
+    assert wire.upserted == []
+
+
+def test_warmup_fans_out_to_sibling_containers(wire, monkeypatch):
+    invokes = []
+
+    class FakeLambda:
+        def invoke(self, **kw):
+            invokes.append(json.loads(kw["Payload"].decode()))
+            return {}
+
+    monkeypatch.setattr(H, "build_session", lambda *a, **k: FakeSession())
+    monkeypatch.setattr(H.boto3, "client", lambda name, **k: FakeLambda())
+    monkeypatch.setattr(H, "LAMBDA_FUNCTION_NAME", "pod-pipeline-stg", raising=False)
+    monkeypatch.setattr(H.time, "sleep", lambda *_: None)
+
+    body = json.loads(H.handler({"warmup": True, "fanout": 3}, FakeContext(900_000))["body"])
+
+    assert body["warmed"] == 3
+    assert len(invokes) == 2                       # this container + 2 siblings
+    assert all(i["fanout"] == 0 for i in invokes)  # siblings never recurse
+
+
+def test_warm_connection_is_reused_across_invocations(monkeypatch):
+    """A warm container must not redial Postgres for every trip."""
+    conn = FakeConn()
+    dials = {"n": 0}
+
+    def _dial(*a, **k):
+        dials["n"] += 1
+        return conn
+
+    monkeypatch.setattr(H, "_conn", None, raising=False)
+    monkeypatch.setattr(H, "_connect", _dial)
+    assert H.get_db_connection() is conn
+    assert H.get_db_connection() is conn
+    assert dials["n"] == 1                         # dialled once, reused after
+    H.release_db_connection(conn)
+    assert conn.closed == 0                        # the warm handle stays open
+
+
+def test_warm_connection_redials_when_stale(monkeypatch):
+    dead, fresh = FakeConn(), FakeConn()
+    dead.closed = 1
+    monkeypatch.setattr(H, "_conn", dead, raising=False)
+    monkeypatch.setattr(H, "_connect", lambda *a, **k: fresh)
+    assert H.get_db_connection() is fresh
+
+
+# --------------------------------------------------------------------------- #
+# Batch selection: date range / ad-hoc SQL
+# --------------------------------------------------------------------------- #
+
+def test_resolve_batch_source_defaults_to_source_query(monkeypatch):
+    monkeypatch.setattr(H, "SOURCE_QUERY", "SELECT 1", raising=False)
+    sql, params, source = H.resolve_batch_source({})
+    assert (sql, params, source) == ("SELECT 1", None, "source_query")
+
+
+def test_resolve_batch_source_binds_date_range():
+    sql, params, source = H.resolve_batch_source(
+        {"start_date": "2026-08-01", "end_date": "2026-08-20"})
+    assert source == "date_range"
+    assert params == {"start_date": "2026-08-01", "end_date": "2026-08-20"}
+    assert "%(start_date)s" in sql and "%(end_date)s" in sql
+
+
+def test_resolve_batch_source_single_date_is_a_one_day_range():
+    _, params, _ = H.resolve_batch_source({"start_date": "2026-08-01"})
+    assert params == {"start_date": "2026-08-01", "end_date": "2026-08-01"}
+
+
+@pytest.mark.parametrize("event", [
+    {"start_date": "01-08-2026", "end_date": "2026-08-20"},
+    {"start_date": "2026-08-20", "end_date": "2026-08-01"},
+])
+def test_resolve_batch_source_rejects_bad_ranges(event):
+    with pytest.raises(ValueError):
+        H.resolve_batch_source(event)
+
+
+def test_adhoc_query_accepts_read_only_sql(monkeypatch):
+    monkeypatch.setattr(H, "ALLOW_ADHOC_QUERY", True, raising=False)
+    sql, params, source = H.resolve_batch_source(
+        {"query": "SELECT awb, trip_id, pod FROM pod_manual_verification WHERE awb = 'X';"})
+    assert source == "adhoc_query" and params is None
+    assert sql.endswith("'X'")            # trailing semicolon stripped
+    assert H.resolve_batch_source({"query": "WITH x AS (SELECT 1) SELECT * FROM x"})[2] == "adhoc_query"
+
+
+@pytest.mark.parametrize("bad", [
+    "DELETE FROM pod_scores",
+    "SELECT 1; DROP TABLE pod_scores",
+    "UPDATE pod_scores SET pod_score = 1",
+    "SELECT 1 -- comment",
+    "INSERT INTO pod_scores VALUES (1)",
+    "TRUNCATE pod_scores",
+    "",
+])
+def test_adhoc_query_rejects_anything_that_writes(monkeypatch, bad):
+    monkeypatch.setattr(H, "ALLOW_ADHOC_QUERY", True, raising=False)
+    with pytest.raises(ValueError):
+        H.resolve_batch_source({"query": bad})
+
+
+def test_adhoc_query_can_be_disabled(monkeypatch):
+    monkeypatch.setattr(H, "ALLOW_ADHOC_QUERY", False, raising=False)
+    with pytest.raises(ValueError):
+        H.resolve_batch_source({"query": "SELECT 1"})
+
+
+def test_batch_handler_runs_a_date_range(wire, monkeypatch):
+    seen = {}
+
+    def _fetch(sql=None, params=None):
+        seen["sql"], seen["params"] = sql, params
+        return _mb_df(3)
+
+    monkeypatch.setattr(H, "fetch_pod_data", _fetch)
+    monkeypatch.setattr(H, "build_session", lambda *a, **k: FakeSession())
+
+    body = json.loads(H.handler(
+        {"start_date": "2026-08-01", "end_date": "2026-08-02"}, FakeContext(900_000))["body"])
+
+    assert body["mode"] == "batch" and body["source"] == "date_range"
+    assert seen["params"] == {"start_date": "2026-08-01", "end_date": "2026-08-02"}
+    assert body["scored_this_invocation"] == 3
+
+
+def test_batch_handler_rejects_a_bad_request_with_400(wire, monkeypatch):
+    monkeypatch.setattr(H, "build_session", lambda *a, **k: FakeSession())
+    resp = H.handler({"query": "DROP TABLE pod_scores"}, FakeContext(900_000))
+    assert resp["statusCode"] == 400
+    assert wire.upserted == []
+
+
+def test_continuation_carries_the_selection_forward(wire, monkeypatch):
+    payloads = []
+    monkeypatch.setattr(H, "invoke_continuation",
+                        lambda rid, rd, c, sel=None: payloads.append(sel))
+    monkeypatch.setattr(H, "fetch_pod_data", lambda sql=None, params=None: _mb_df(2000))
+    monkeypatch.setattr(H, "build_session", lambda *a, **k: FakeSession())
+
+    H.handler({"start_date": "2026-08-01", "end_date": "2026-08-02"}, FakeContext(1_000))
+    assert payloads == [{"start_date": "2026-08-01", "end_date": "2026-08-02"}]
+
+
+# --------------------------------------------------------------------------- #
+# Schema migration / teardown
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def schema_file(tmp_path, monkeypatch):
+    f = tmp_path / "schema.sql"
+    f.write_text("CREATE TABLE IF NOT EXISTS pod_scores (id serial);")
+    monkeypatch.setattr(H, "SCHEMA_PATH", str(f), raising=False)
+    return f
+
+
+def test_migrate_applies_the_baked_in_schema(wire, schema_file):
+    body = json.loads(H.handler({"migrate": True}, FakeContext(900_000))["body"])
+
+    assert body["status"] == "applied"
+    assert body["destructive"] is False
+    assert wire.committed == 1
+    assert any("CREATE TABLE IF NOT EXISTS pod_scores" in sql for sql, _ in wire.executed)
+
+
+def test_migrate_is_idempotent(wire, schema_file):
+    """schema.sql is IF NOT EXISTS throughout — CI applies it on every deploy."""
+    for _ in range(3):
+        body = json.loads(H.handler({"migrate": True}, FakeContext(900_000))["body"])
+        assert body["status"] == "applied"
+    assert wire.committed == 3
+
+
+def test_migrate_reports_a_missing_schema_file(wire, monkeypatch):
+    monkeypatch.setattr(H, "SCHEMA_PATH", "/nope/schema.sql", raising=False)
+    resp = H.handler({"migrate": True}, FakeContext(900_000))
+
+    assert resp["statusCode"] == 500
+    assert json.loads(resp["body"])["status"] == "failed"
+    assert wire.committed == 0
+
+
+def test_migrate_never_scores(wire, schema_file):
+    H.handler({"migrate": True}, FakeContext(900_000))
+    assert wire.upserted == []
+
+
+def test_destructive_drop_requires_the_functions_own_name(wire, monkeypatch):
+    monkeypatch.setattr(H, "LAMBDA_FUNCTION_NAME", "pod-pipeline-stg", raising=False)
+
+    for bad in ({"migrate": "drop"},
+                {"migrate": "drop", "confirm": ""},
+                {"migrate": "drop", "confirm": "pod-pipeline-prod"},   # another env
+                {"migrate": "drop", "confirm": "yes"}):
+        resp = H.handler(bad, FakeContext(900_000))
+        assert resp["statusCode"] == 400, bad
+        assert json.loads(resp["body"])["status"] == "refused"
+
+    assert wire.committed == 0
+    assert not any("DROP" in sql for sql, _ in wire.executed)
+
+
+def test_destructive_drop_runs_when_confirmed(wire, monkeypatch):
+    monkeypatch.setattr(H, "LAMBDA_FUNCTION_NAME", "pod-pipeline-stg", raising=False)
+
+    body = json.loads(H.handler(
+        {"migrate": "drop", "confirm": "pod-pipeline-stg"}, FakeContext(900_000))["body"])
+
+    assert body["status"] == "dropped"
+    assert body["destructive"] is True
+    dropped = [sql for sql, _ in wire.executed if sql.startswith("DROP")]
+    assert dropped == ["DROP VIEW IF EXISTS pod_scores_flagged",
+                       "DROP TABLE IF EXISTS pod_scores"]      # view before table
+
+
+def test_destructive_drop_is_refused_when_the_function_is_unnamed(wire, monkeypatch):
+    """Locally / in tests there is no function name — nothing to confirm against."""
+    monkeypatch.setattr(H, "LAMBDA_FUNCTION_NAME", "", raising=False)
+    resp = H.handler({"migrate": "drop", "confirm": ""}, FakeContext(900_000))
+    assert resp["statusCode"] == 400
+
+
+def test_migrate_wins_over_the_other_lanes(wire, schema_file, monkeypatch):
+    """A migrate event carrying a stray trip_id must not start scoring."""
+    monkeypatch.setattr(H, "handle_single_trip",
+                        lambda e, c: pytest.fail("should not have scored"))
+    body = json.loads(H.handler(
+        {"migrate": True, "trip_id": 5}, FakeContext(900_000))["body"])
+    assert body["status"] == "applied"

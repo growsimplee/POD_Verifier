@@ -20,6 +20,11 @@ COPY src/ ${LAMBDA_TASK_ROOT}/src/
 COPY model/best.pt /opt/model/best.pt
 COPY handler.py ${LAMBDA_TASK_ROOT}/
 
+# Schema for the {"migrate": true} bootstrap event. deploy.sh stages this from
+# infra/schema.sql into the build context, so infra/schema.sql stays the single
+# source of truth and the file here is generated, never edited.
+COPY schema.sql /opt/schema/schema.sql
+
 # Fail the build early if the runtime stack is broken, and confirm the
 # checkpoint loads into the architecture with no key mismatches.
 RUN python -c "import torch, timm, cv2, numpy, psycopg2, boto3; print('deps ok', torch.__version__, 'numpy', numpy.__version__)" \

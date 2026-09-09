@@ -1,8 +1,17 @@
 # POD_Verifier
 
-AWS Lambda pipeline for POD quality scoring: Metabase → single container Lambda (download to `/tmp` → EfficientNet inference) → PostgreSQL.
+AWS Lambda pipeline for POD quality scoring: **Sarathy POD verification request → single container Lambda (per-trip image download → EfficientNet inference) → PostgreSQL `pod_scores`**.
+
+Scoring is event-driven per trip (the daily cron sweep is kept but disabled, for backfills).
 
 See **[aws/README.md](aws/README.md)** for architecture and deployment (CloudFormation + Docker/ECR, **no SAM**).
+
+## Deploying
+
+Merge to `stag-main` for staging (automatic) or `prod-main` for production (one
+approval). CircleCI creates everything the service needs — ECR repository,
+CloudFormation stack, Lambda, schedules, alarms and the database schema — from
+nothing. See **[aws/DEPLOYMENT.md](aws/DEPLOYMENT.md)**.
 
 ## Repository layout
 

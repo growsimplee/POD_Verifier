@@ -1,21 +1,23 @@
 #!/usr/bin/env bash
-# Build POD Lambda CPU image → ECR login → push → lambda update-function-code.
+# Build the POD scorer image → create the ECR repo if absent → push.
 # NO SAM — plain Docker + AWS CLI. Infra is CloudFormation (aws/infra/stack.yaml)
-# applied by aws/provision-stack.sh.
+# applied by aws/provision-stack.sh, which is what actually points the function
+# at an image; this script only has to get the image into ECR.
 #
-# Handler: single-invocation, resilient scorer — query Postgres for POD rows, expand links,
-# concurrently download images to memory, ImageNet-normalized EfficientNet scoring,
-# idempotent upsert to Postgres, resume + bounded self-continuation. Scheduler
-# sends an empty event {} once per day.
+# Handler: event-driven per-trip scorer (Sarathy invokes it when a rider raises a
+# POD verification request), plus batch modes for backfills and a {"migrate": true}
+# bootstrap that applies infra/schema.sql from inside the VPC.
+#
+# Everything here is idempotent, so CI can run it on a completely empty account:
+#   * the ECR repository is created when missing
+#   * infra/schema.sql is staged into the build context (single source of truth)
+#   * the Lambda update is skipped automatically when the function does not exist yet
 #
 # Local build smoke-test without AWS credentials:
 #   DRY_RUN=true ./deploy.sh
 #
-# First CFN bootstrap (push image only, no Lambda yet):
+# Push only, never touch the function (CFN will set the image):
 #   SKIP_LAMBDA_UPDATE=true ./deploy.sh
-#
-# Routine update (build, push, roll Lambda to the new image):
-#   ./deploy.sh
 #
 set -euo pipefail
 
@@ -27,6 +29,16 @@ if [[ ! -f "${CTX}/model/best.pt" ]]; then
   echo "ERROR: ${CTX}/model/best.pt not found. Commit/copy the trained checkpoint first." >&2
   exit 1
 fi
+
+# Stage the schema into the Docker build context. infra/schema.sql stays the one
+# copy anybody edits; the file in lambda_scorer/ is generated and gitignored.
+SCHEMA_SRC="${AWS_DIR}/infra/schema.sql"
+if [[ ! -f "${SCHEMA_SRC}" ]]; then
+  echo "ERROR: ${SCHEMA_SRC} not found — it is baked in for the migrate event." >&2
+  exit 1
+fi
+cp "${SCHEMA_SRC}" "${CTX}/schema.sql"
+echo "==> staged infra/schema.sql into the build context"
 
 AWS_REGION="${AWS_REGION:-us-east-2}"
 STAGE="${STAGE:-stg}"
@@ -62,6 +74,25 @@ fi
 REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 REMOTE_URI="${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
 
+# Create the repository on first run. ECR is regional, so a brand-new region
+# (e.g. standing prod up in ap-south-1) always lands here.
+if aws ecr describe-repositories --repository-names "${ECR_REPOSITORY}" \
+     --region "${AWS_REGION}" >/dev/null 2>&1; then
+  echo "==> ECR repository ${ECR_REPOSITORY} already exists"
+else
+  echo "==> creating ECR repository ${ECR_REPOSITORY} in ${AWS_REGION}"
+  aws ecr create-repository \
+    --repository-name "${ECR_REPOSITORY}" \
+    --region "${AWS_REGION}" \
+    --image-scanning-configuration scanOnPush=true \
+    --image-tag-mutability MUTABLE >/dev/null
+  # Keep the registry from growing without bound: hold the last 15 images.
+  aws ecr put-lifecycle-policy \
+    --repository-name "${ECR_REPOSITORY}" \
+    --region "${AWS_REGION}" \
+    --lifecycle-policy-text '{"rules":[{"rulePriority":1,"description":"keep last 15","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":15},"action":{"type":"expire"}}]}' >/dev/null
+fi
+
 echo "==> ECR login ${REGISTRY}"
 aws ecr get-login-password --region "${AWS_REGION}" \
   | docker login --username AWS --password-stdin "${REGISTRY}"
@@ -83,6 +114,10 @@ echo "Image URI: ${REMOTE_URI}"
 
 if [[ "${SKIP_LAMBDA_UPDATE}" == "true" ]]; then
   echo "SKIP_LAMBDA_UPDATE=true → skipping lambda update-function-code."
+elif ! aws lambda get-function-configuration \
+       --function-name "${LAMBDA_FUNCTION}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+  echo "${LAMBDA_FUNCTION} does not exist yet → image-only push."
+  echo "provision-stack.sh will create it pointing at ${REMOTE_URI}."
 else
   echo "==> aws lambda update-function-code ${LAMBDA_FUNCTION}"
   aws lambda update-function-code \

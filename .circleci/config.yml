@@ -1,50 +1,74 @@
-# POD Verifier — CI/CD for the container Lambda (aws/lambda_scorer).
+# POD Verifier — self-bootstrapping CI/CD for the container Lambda.
 #
-# Mirrors aws/DEPLOYMENT.md: plain Docker + AWS CLI + CloudFormation (no SAM/CDK).
-#   build-and-test  → docker buildx (DRY_RUN=true ./deploy.sh) + pytest inside the image
-#   deploy          → ./deploy.sh (ECR login → push → lambda update-function-code)
-#   provision-stack → ./provision-stack.sh (aws cloudformation deploy), manual-gated
+# Merge to a branch, and CI creates everything the service needs from nothing:
 #
-# Required CircleCI context "pod-verifier-aws":
-#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY   (ECR/Lambda/CFN/IAM permissions)
-# Required only for the provision-stack job (same or a separate context):
-#   VPC_ID, SUBNET_IDS, SOURCE_QUERY, PG_HOST, PG_PASSWORD
-#   optional: PG_PORT PG_DATABASE PG_USER FLAG_THRESHOLD INFERENCE_BATCH_SIZE
-#             MAX_DOWNLOAD_WORKERS WINDOW_SIZE IMAGENET_NORMALIZE TMP_EPHEMERAL_MB
+#     stag-main   → staging  (us-east-2, pod-scoring-stg)   automatic
+#     prod-main   → prod     (ap-south-1, pod-scoring-prod) manual approval
+#     every other branch     build + test only, no AWS writes
+#
+# The release job is idempotent and safe on an empty account. In order it:
+#   1. preflight       — fail fast, listing every missing context variable
+#   2. build + push    — creates the ECR repository if it does not exist
+#   3. cloudformation  — creates or updates the stack, pointed at this commit's
+#                        image tag, so CFN is the only thing that sets the
+#                        function's image (no separate update-function-code race)
+#   4. migrate         — invokes {"migrate": true}; the function is inside the
+#                        VPC, so this is how the schema reaches a private RDS
+#                        that CircleCI itself cannot dial
+#   5. smoke           — a warm ping, then verifies the live image tag
+#
+# There is no manual "create the ECR repo" or "run schema.sql" step any more.
+# What CI still cannot invent is the platform it sits on: the VPC, the subnets
+# and the database. Those come from the context and preflight names them.
+#
+# ---------------------------------------------------------------------------
+# CircleCI contexts — the growsimplee org's existing ones, same as sarathy uses:
+#
+#   Aws-stage, Aws-stage-extra   (stag-main workflow)
+#   Aws-prod,  Aws-prod-extra    (prod-main workflow)
+#
+# Those contexts name their credentials ACCESS_KEY_ID / AWS_ACCESS_KEY (the
+# second holds the SECRET, despite the name) rather than the standard
+# AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY. The configure-aws step below
+# accepts either spelling, so nothing has to be renamed in the org.
+#
+# IAM: those keys were provisioned for sarathy's build-and-push. This pipeline
+# additionally needs CloudFormation, IAM (it creates two roles), Logs, SNS,
+# CloudWatch alarms, SQS, EC2 (security group + VPC ENIs), Scheduler and
+# lambda:InvokeFunction. If the release job fails with AccessDenied, that is
+# why — widen the policy rather than working around it here.
+#
+# Each context must ALSO provide these, which are specific to this service and
+# will not already be there:
+#   VPC_ID                  vpc-…
+#   SUBNET_IDS              subnet-a,subnet-b  (NAT egress + a route to the RDS)
+#   PG_HOST, PG_PASSWORD    results + source database
+#
+# Optional, per context:
+#   SOURCE_QUERY TRIP_QUERY RANGE_QUERY ALLOW_ADHOC_QUERY RESCORE_LOOKBACK_DAYS
+#   PG_PORT PG_DATABASE PG_USER FLAG_THRESHOLD INFERENCE_BATCH_SIZE
+#   MAX_DOWNLOAD_WORKERS TRIP_MAX_DOWNLOAD_WORKERS WINDOW_SIZE IMAGENET_NORMALIZE
+#   WARM_POOL_SIZE WARMUP_RATE RESERVED_CONCURRENCY TMP_EPHEMERAL_MB
+#   LOG_RETENTION_DAYS ALARM_EMAIL INVOKER_PRINCIPAL_ARNS
 #
 # Prefer OIDC over long-lived keys? Replace the aws-cli/setup step with
 # aws-cli/setup: { role_arn: $AWS_ROLE_ARN, region: $AWS_REGION } and drop the keys.
-#
-# Need to push an infra/env-var-only change (e.g. a new SOURCE_QUERY) without
-# rebuilding or redeploying the image? Trigger a pipeline from the CircleCI UI
-# ("Trigger Pipeline") with parameter provision_only=true. That runs only
-# hold-provision → provision-stack, pointed at the ":latest" image already in
-# ECR — no build-and-test, no deploy.
+# ---------------------------------------------------------------------------
 version: 2.1
 
-orbs:
-  aws-cli: circleci/aws-cli@5.4
-
 parameters:
-  aws_region:
-    type: string
-    default: us-east-2
   ecr_repository:
     type: string
     default: pod-pipeline
-  stage:
-    type: string
-    default: stg
-  stack_name:
-    type: string
-    default: pod-scoring-stg
+  # Set true from the CircleCI UI to re-apply the stack (an env-var-only change)
+  # against the image already published as :latest — no rebuild, no redeploy.
   provision_only:
     type: boolean
     default: false
 
 executors:
-  # Machine executor: the image build needs a real Docker daemon with buildx,
-  # and torch/torchvision CPU wheels make this a heavy build.
+  # The image build needs a real Docker daemon with buildx, and the torch CPU
+  # wheels make it heavy.
   docker-builder:
     machine:
       image: ubuntu-2404:current
@@ -53,29 +77,31 @@ executors:
     working_directory: ~/project
 
 commands:
-  set-build-env:
-    description: Common build/deploy environment (image tag is the commit SHA).
+  set-env:
+    description: Resolve region/stage/stack for this environment and pin the image tag.
+    parameters:
+      aws_region: { type: string }
+      stage:      { type: string }
+      stack_name: { type: string }
+      image_tag:  { type: string, default: "sha" }
     steps:
       - run:
           name: Export build environment
           command: |
             {
-              echo 'export AWS_REGION="<< pipeline.parameters.aws_region >>"'
-              echo 'export AWS_DEFAULT_REGION="<< pipeline.parameters.aws_region >>"'
+              echo 'export AWS_REGION="<< parameters.aws_region >>"'
+              echo 'export AWS_DEFAULT_REGION="<< parameters.aws_region >>"'
               echo 'export ECR_REPOSITORY="<< pipeline.parameters.ecr_repository >>"'
-              echo 'export STAGE="<< pipeline.parameters.stage >>"'
-              # provision_only runs against whatever is already published as
-              # :latest (set by every deploy) instead of this commit's tag,
-              # since provision-only pipelines skip build-and-test/deploy and
-              # this commit's own image tag may never have been pushed.
-              if << pipeline.parameters.provision_only >>; then
+              echo 'export STAGE="<< parameters.stage >>"'
+              echo 'export STACK_NAME="<< parameters.stack_name >>"'
+              if [ "<< parameters.image_tag >>" = "latest" ]; then
                 echo 'export IMAGE_TAG="latest"'
               else
                 echo "export IMAGE_TAG=\"${CIRCLE_SHA1:0:12}\""
               fi
               # Must match stack.yaml: FunctionName: !Sub pod-pipeline-${Stage}
               # (independent of the ECR repo name — do not derive it from that).
-              echo "export LAMBDA_FUNCTION=\"pod-pipeline-<< pipeline.parameters.stage >>\""
+              echo "export LAMBDA_FUNCTION=\"pod-pipeline-<< parameters.stage >>\""
             } >> "$BASH_ENV"
       - run:
           name: Verify the trained checkpoint is present
@@ -84,21 +110,89 @@ commands:
               || { echo "aws/lambda_scorer/model/best.pt missing — it is baked into the image"; exit 1; }
             ls -lh aws/lambda_scorer/model/best.pt
 
+  configure-aws:
+    description: >
+      Normalise credentials into the standard environment variables and pin the
+      region for this deployment. The org contexts use ACCESS_KEY_ID and
+      AWS_ACCESS_KEY (secret); the standard names are accepted too, so this
+      works whichever way a context is set up.
+    parameters:
+      aws_region: { type: string }
+    steps:
+      - run:
+          name: Configure AWS credentials and region
+          command: |
+            KEY_ID="${AWS_ACCESS_KEY_ID:-${ACCESS_KEY_ID:-}}"
+            SECRET="${AWS_SECRET_ACCESS_KEY:-${AWS_ACCESS_KEY:-}}"
+            if [ -z "${KEY_ID}" ] || [ -z "${SECRET}" ]; then
+              echo "No AWS credentials in the context."
+              echo "Expected ACCESS_KEY_ID + AWS_ACCESS_KEY (org convention),"
+              echo "or AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY (standard)."
+              exit 1
+            fi
+            # The deployment target is decided by the workflow, not the context.
+            # A context region that disagrees usually means the context belongs
+            # to a different environment than the branch does — say so loudly.
+            if [ -n "${AWS_REGION:-}" ] && [ "${AWS_REGION}" != "<< parameters.aws_region >>" ]; then
+              echo "WARNING: context AWS_REGION=${AWS_REGION} but this workflow deploys"
+              echo "         to << parameters.aws_region >>. Using << parameters.aws_region >>."
+            fi
+            {
+              echo "export AWS_ACCESS_KEY_ID=\"${KEY_ID}\""
+              echo "export AWS_SECRET_ACCESS_KEY=\"${SECRET}\""
+            } >> "$BASH_ENV"
+            command -v aws >/dev/null 2>&1 || {
+              echo "Installing AWS CLI v2"
+              curl -sS "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+              unzip -q /tmp/awscliv2.zip -d /tmp && sudo /tmp/aws/install --update
+            }
+            aws --version
+
+  preflight:
+    description: >
+      Fail before touching AWS if the context is incomplete, naming every missing
+      variable at once rather than one per re-run.
+    steps:
+      - run:
+          name: Check required context variables
+          command: |
+            missing=""
+            for v in VPC_ID SUBNET_IDS PG_HOST PG_PASSWORD; do
+              [ -n "${!v:-}" ] || missing="${missing} ${v}"
+            done
+            if [ -n "${missing}" ]; then
+              echo "Missing from the CircleCI context:${missing}"
+              echo "See the header of .circleci/config.yml for what each one is."
+              exit 1
+            fi
+            echo "Context complete for ${STAGE} in ${AWS_REGION}."
+            echo "Deploying as: $(aws sts get-caller-identity --query Arn --output text)"
+            case "${SUBNET_IDS}" in
+              *,*) : ;;
+              *) echo "WARNING: SUBNET_IDS has a single subnet — no AZ redundancy." ;;
+            esac
+
 jobs:
-  # Builds the exact image that ships, then runs the handler test suite inside it
-  # so pytest sees the pinned torch/timm/cv2 stack instead of a CI-only install.
+  # Builds the exact image that ships, then runs the handler suite inside it so
+  # pytest sees the pinned torch/timm/cv2 stack instead of a CI-only install.
   build-and-test:
     executor: docker-builder
     steps:
       - checkout
-      - set-build-env
+      - set-env: { aws_region: us-east-2, stage: stg, stack_name: unused }
       - run:
           name: Build image (DRY_RUN — no AWS calls)
           no_output_timeout: 30m
           command: |
             cd aws
-            chmod +x deploy.sh provision-stack.sh
+            chmod +x deploy.sh provision-stack.sh teardown.sh
             DRY_RUN=true ./deploy.sh
+      - run:
+          name: The schema must be baked in — the migrate event reads it at runtime
+          command: |
+            docker run --rm --entrypoint /bin/bash \
+              "pod-pipeline-local:${IMAGE_TAG}" -c \
+              "test -s /opt/schema/schema.sql && head -3 /opt/schema/schema.sql"
       - run:
           name: pytest inside the built image
           command: |
@@ -112,124 +206,146 @@ jobs:
       - store_artifacts:
           path: aws/lambda_scorer/test-results
 
-  # Rebuild (cheap-ish: same layers when DLC is on), push to ECR, roll the Lambda.
-  deploy:
+  # Everything needed to go from an empty account to a working service.
+  release:
     executor: docker-builder
+    parameters:
+      aws_region: { type: string }
+      stage:      { type: string }
+      stack_name: { type: string }
+      image_tag:  { type: string, default: "sha" }
+      build:      { type: boolean, default: true }
     steps:
       - checkout
-      - set-build-env
-      - aws-cli/setup:
-          region: << pipeline.parameters.aws_region >>
-      # Bootstrap: on a brand-new stage the Lambda does not exist yet (it is created
-      # by provision-stack, which needs an image already in ECR). Push the image and
-      # skip the function update in that case instead of failing with
-      # ResourceNotFoundException — the next deploy rolls the function normally.
+      - set-env:
+          aws_region: << parameters.aws_region >>
+          stage: << parameters.stage >>
+          stack_name: << parameters.stack_name >>
+          image_tag: << parameters.image_tag >>
+      - configure-aws:
+          aws_region: << parameters.aws_region >>
+      - preflight
+
+      - when:
+          condition: << parameters.build >>
+          steps:
+            - run:
+                name: Build, create the ECR repo if absent, push
+                no_output_timeout: 30m
+                command: |
+                  cd aws
+                  chmod +x deploy.sh
+                  # CloudFormation owns the function's image, so never race it
+                  # here — push only.
+                  SKIP_LAMBDA_UPDATE=true ./deploy.sh
+            - run:
+                name: Also publish the :latest tag
+                command: |
+                  ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+                  REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+                  docker tag "pod-pipeline-local:${IMAGE_TAG}" "${REGISTRY}/${ECR_REPOSITORY}:latest"
+                  docker push "${REGISTRY}/${ECR_REPOSITORY}:latest"
+
       - run:
-          name: Does the Lambda exist yet?
-          command: |
-            if aws lambda get-function-configuration \
-                 --function-name "${LAMBDA_FUNCTION}" --region "${AWS_REGION}" >/dev/null 2>&1; then
-              echo "export SKIP_LAMBDA_UPDATE=false" >> "$BASH_ENV"
-              echo "${LAMBDA_FUNCTION} exists — will update its code."
-            else
-              echo "export SKIP_LAMBDA_UPDATE=true" >> "$BASH_ENV"
-              echo "${LAMBDA_FUNCTION} not found — image-only push (bootstrap)."
-              echo "Approve the provision-stack job to create it from aws/infra/stack.yaml."
-            fi
-      - run:
-          name: Build, push to ECR, update function code
+          name: Deploy the stack (creates it on first run)
           no_output_timeout: 30m
           command: |
             cd aws
-            chmod +x deploy.sh
-            ./deploy.sh
-      - run:
-          name: Also publish the :latest tag
-          command: |
+            chmod +x provision-stack.sh
             ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-            REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-            docker tag "pod-pipeline-local:${IMAGE_TAG}" "${REGISTRY}/${ECR_REPOSITORY}:latest"
-            docker push "${REGISTRY}/${ECR_REPOSITORY}:latest"
+            export SCORER_IMAGE_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${IMAGE_TAG}"
+            ./provision-stack.sh
+
       - run:
-          name: Wait for the function update and verify the image URI
+          name: Apply the database schema from inside the VPC
           command: |
-            if [ "${SKIP_LAMBDA_UPDATE}" = "true" ]; then
-              echo "Bootstrap run — no function to verify. Image is in ECR at tag ${IMAGE_TAG}."
-              exit 0
-            fi
             aws lambda wait function-updated \
               --function-name "${LAMBDA_FUNCTION}" --region "${AWS_REGION}"
+            aws lambda invoke \
+              --function-name "${LAMBDA_FUNCTION}" --region "${AWS_REGION}" \
+              --payload '{"migrate": true}' --cli-binary-format raw-in-base64-out \
+              /tmp/migrate.json >/dev/null
+            cat /tmp/migrate.json; echo
+            grep -q '"status": "applied"' /tmp/migrate.json \
+              || { echo "Schema migration did not report applied — see the payload above."; exit 1; }
+
+      - run:
+          name: Smoke test — warm the function and verify the live image
+          command: |
+            aws lambda invoke \
+              --function-name "${LAMBDA_FUNCTION}" --region "${AWS_REGION}" \
+              --payload '{"warmup": true, "fanout": 1}' --cli-binary-format raw-in-base64-out \
+              /tmp/warm.json >/dev/null
+            cat /tmp/warm.json; echo
+            grep -q '"status": "warm"' /tmp/warm.json \
+              || { echo "Warm ping failed — the container did not come up."; exit 1; }
             # The image URI lives on get-function (Code.ImageUri), NOT on
-            # get-function-configuration — that API has no ImageUri field and
-            # returns None, which would fail the comparison below every time.
+            # get-function-configuration — that API has no ImageUri field.
             LIVE="$(aws lambda get-function \
               --function-name "${LAMBDA_FUNCTION}" --region "${AWS_REGION}" \
               --query 'Code.ImageUri' --output text)"
             echo "live image: ${LIVE}"
             case "${LIVE}" in
-              *":${IMAGE_TAG}") echo "OK — function is on ${IMAGE_TAG}" ;;
+              *":${IMAGE_TAG}") echo "OK — ${LAMBDA_FUNCTION} is on ${IMAGE_TAG}" ;;
               *) echo "MISMATCH — expected tag ${IMAGE_TAG}"; exit 1 ;;
             esac
-      # Not invoking the function here on purpose: the empty {} payload is a full
-      # day's scoring run. Smoke-test manually per aws/DEPLOYMENT.md when needed.
-
-  # Infra changes only (stack.yaml / operating knobs). Manual-approval gated.
-  provision-stack:
-    executor: docker-builder
-    steps:
-      - checkout
-      - set-build-env
-      - aws-cli/setup:
-          region: << pipeline.parameters.aws_region >>
-      - run:
-          name: aws cloudformation deploy
-          command: |
-            cd aws
-            chmod +x provision-stack.sh
-            ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-            export STACK_NAME="<< pipeline.parameters.stack_name >>"
-            export SCORER_IMAGE_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${IMAGE_TAG}"
-            ./provision-stack.sh
+      # Deliberately not invoking a real scoring run here: {} is a whole-dataset
+      # sweep and {"trip_id": N} needs a trip that exists. See aws/DEPLOYMENT.md.
 
 workflows:
-  build-test-deploy:
+  # ---- staging: merge to stag-main and CI does the rest ------------------- #
+  staging:
     when:
       equal: [false, << pipeline.parameters.provision_only >>]
     jobs:
-      - build-and-test
+      - build-and-test:
+          filters:
+            branches:
+              ignore: [prod-main]
 
-      - hold-deploy:
-          type: approval
+      - release:
+          name: release-staging
+          context: [Aws-stage, Aws-stage-extra]
           requires: [build-and-test]
+          aws_region: us-east-2
+          stage: stg
+          stack_name: pod-scoring-stg
           filters:
             branches:
-              only: [main, circleci-project-setup]
+              only: [stag-main]
 
-      - deploy:
-          context: [pod-verifier-aws]
-          requires: [hold-deploy]
+  # ---- production: same pipeline, one click ------------------------------ #
+  production:
+    when:
+      equal: [false, << pipeline.parameters.provision_only >>]
+    jobs:
+      - build-and-test:
+          name: build-and-test-prod
           filters:
             branches:
-              only: [main, circleci-project-setup]
+              only: [prod-main]
 
-      # Run only when infra/stack.yaml changed; approve after the image is pushed
-      # so SCORER_IMAGE_URI points at a tag that exists in ECR.
-      - hold-provision:
+      - hold-production:
           type: approval
-          requires: [deploy]
+          requires: [build-and-test-prod]
           filters:
             branches:
-              only: [main, circleci-project-setup]
+              only: [prod-main]
 
-      - provision-stack:
-          context: [pod-verifier-aws]
-          requires: [hold-provision]
+      - release:
+          name: release-production
+          context: [Aws-prod, Aws-prod-extra]
+          requires: [hold-production]
+          aws_region: ap-south-1
+          stage: prod
+          stack_name: pod-scoring-prod
           filters:
             branches:
-              only: [main, circleci-project-setup]
+              only: [prod-main]
 
-  # Direct path: infra/env-var-only changes (e.g. a new SOURCE_QUERY) without
-  # touching the image. Trigger via CircleCI UI with provision_only=true.
+  # ---- infra/env-var-only change, no rebuild ----------------------------- #
+  # Trigger from the CircleCI UI with provision_only=true. Re-applies the stack
+  # against whatever is already published as :latest.
   provision-only:
     when:
       equal: [true, << pipeline.parameters.provision_only >>]
@@ -238,11 +354,30 @@ workflows:
           type: approval
           filters:
             branches:
-              only: [main, provison-only]
+              only: [stag-main, prod-main]
 
-      - provision-stack:
-          context: [pod-verifier-aws]
+      - release:
+          name: reprovision-staging
+          context: [Aws-stage, Aws-stage-extra]
           requires: [hold-provision]
+          aws_region: us-east-2
+          stage: stg
+          stack_name: pod-scoring-stg
+          image_tag: latest
+          build: false
           filters:
             branches:
-              only: [main, provision-only]
+              only: [stag-main]
+
+      - release:
+          name: reprovision-production
+          context: [Aws-prod, Aws-prod-extra]
+          requires: [hold-provision]
+          aws_region: ap-south-1
+          stage: prod
+          stack_name: pod-scoring-prod
+          image_tag: latest
+          build: false
+          filters:
+            branches:
+              only: [prod-main]

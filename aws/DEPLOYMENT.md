@@ -9,60 +9,99 @@ Infra is plain **CloudFormation** + Docker + AWS CLI — **no SAM, no CDK**.
   **ImageNet-normalized inference by default**), `src/model.py`, `model/best.pt`.
 - **`Dockerfile`**: CPU-only torch 2.2.2 / torchvision 0.17.2 (pinned), `numpy<2`;
   build-time check that deps import and the checkpoint loads with 0 key mismatches.
-- **Infra** (`infra/stack.yaml`): VPC Lambda (10 GB / 900 s), EventBridge daily trigger
-  (empty event `{}`), async retries + SQS DLQ, IAM.
-- **Scripts**: `deploy.sh` (build → ECR → update function), `provision-stack.sh`
-  (`aws cloudformation deploy`), `infra/schema.sql` (v2 with the idempotency key).
+- **Infra** (`infra/stack.yaml`): VPC Lambda (10 GB / 900 s), event-driven per-trip
+  invocation from Sarathy, a warm-pool schedule, a **DISABLED** EventBridge daily
+  trigger kept for backfills, async retries + SQS DLQ, IAM, an explicit log group
+  with retention, and alarms (errors, throttles, DLQ depth, uncovered images) on
+  an SNS topic.
+- **Scripts**: `deploy.sh` (ECR repo + build + push), `provision-stack.sh`
+  (`aws cloudformation deploy`), `teardown.sh` (destroy an environment).
 
-## Prerequisites
+## The normal path: merge and walk away
+
+```
+stag-main  →  build + test  →  release           (staging, us-east-2, automatic)
+prod-main  →  build + test  →  approve → release (prod, ap-south-1)
+any other  →  build + test only, no AWS writes
+```
+
+`release` is idempotent and safe against a completely empty account. It creates
+the ECR repository if it is missing, pushes this commit's image, creates or
+updates the CloudFormation stack pointed at that exact tag, applies the database
+schema, and smoke-tests the result. There is no manual "create the repo" or "run
+schema.sql" step.
+
+The schema is applied by invoking the function with `{"migrate": true}` rather
+than by connecting to Postgres from CI. The database sits in a private subnet
+CircleCI cannot reach; the Lambda is already inside the VPC, so it is the one
+thing that can. `schema.sql` is baked into the image at `/opt/schema/schema.sql`
+(staged from `infra/schema.sql` by `deploy.sh` — edit `infra/schema.sql`, never
+the staged copy).
+
+### What CI still cannot invent
+
+The platform it runs on. These come from the CircleCI context, and `preflight`
+fails on the first job naming every one that is missing:
+
+| Variable | What it is |
+|---|---|
+| `VPC_ID` | The VPC the function runs in |
+| `SUBNET_IDS` | Comma-separated private subnets, with NAT egress and a route to the RDS |
+| `PG_HOST`, `PG_PASSWORD` | The results + source database |
+
+Credentials come from the org contexts (`Aws-stage`, `Aws-prod`), which name
+them `ACCESS_KEY_ID` / `AWS_ACCESS_KEY`. Those keys were created for sarathy's
+build-and-push; this pipeline also needs CloudFormation, IAM, Logs, SNS,
+CloudWatch, SQS, EC2 and Scheduler. An `AccessDenied` in `release` means the
+policy needs widening.
+
+## Prerequisites for running the scripts by hand
 
 - Docker (with buildx) running.
-- AWS CLI v2 authenticated (`AWS_PROFILE` or keys) with ECR/Lambda/CFN/IAM permissions.
+- AWS CLI v2 authenticated with ECR/Lambda/CFN/IAM permissions.
 - `lambda_scorer/model/best.pt` present (baked into the image).
-- Reachability: the Lambda's VPC subnets need egress to the RDS Postgres endpoint
-  (source query + results) and the POD image host (NAT or VPC endpoints).
+- Subnets with egress to the RDS endpoint and the POD image host (NAT or VPC endpoints).
 
-## One-time setup
+## Doing it manually
 
-1. **Database schema** (idempotent; adds `status`/`failure_reason` + the unique
-   `(awb, pod_link, run_date)` key used for upsert/resume):
+The same three steps CI runs, in order:
 
-   ```bash
-   psql "host=<PG_HOST> dbname=pod_classifier user=postgres" -f infra/schema.sql
-   ```
+```bash
+cd aws && chmod +x deploy.sh provision-stack.sh teardown.sh
 
-2. **ECR repo**:
+export AWS_REGION=ap-south-1 STAGE=prod STACK_NAME=pod-scoring-prod
+export ECR_REPOSITORY=pod-pipeline IMAGE_TAG=$(git rev-parse --short=12 HEAD)
+export VPC_ID=vpc-xxx SUBNET_IDS=subnet-a,subnet-b
+export PG_HOST=<db>.rds.amazonaws.com PG_PASSWORD=***
+export INVOKER_PRINCIPAL_ARNS=arn:aws:iam::<acct>:role/<sarathy-prod-role>
 
-   ```bash
-   export AWS_REGION=ap-south-1
-   aws ecr create-repository --repository-name pod-pipeline --region "$AWS_REGION"
-   ```
+SKIP_LAMBDA_UPDATE=true ./deploy.sh          # creates the ECR repo, pushes
 
-3. **Build & push image only** (no Lambda yet):
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+export SCORER_IMAGE_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${IMAGE_TAG}"
+./provision-stack.sh                          # creates the stack + function
 
-   ```bash
-   cd aws && chmod +x deploy.sh provision-stack.sh
-   export ECR_REPOSITORY=pod-pipeline IMAGE_TAG=latest STAGE=prod
-   SKIP_LAMBDA_UPDATE=true ./deploy.sh
-   ```
+aws lambda invoke --function-name pod-pipeline-prod --region "$AWS_REGION" \
+  --payload '{"migrate": true}' --cli-binary-format raw-in-base64-out /dev/stdout
+```
 
-   Note the printed image URI for the next step.
+## Tearing an environment down
 
-4. **Create the stack** (private subnets comma-separated; secrets from env/CI —
-   never commit them):
+`teardown.sh` reverses all of it, including **dropping `pod_scores` and
+`pod_scores_flagged`** — every score computed so far. It drops the table first,
+while the function that can reach the database still exists, then deletes the
+stack, the ECR repository and any orphaned log group.
 
-   ```bash
-   export STACK_NAME=pod-scoring-prod
-   export VPC_ID=vpc-xxx
-   export SUBNET_IDS=subnet-a,subnet-b
-   export SOURCE_QUERY="SELECT awb, trip_id, pod FROM pod_manual_verification WHERE created_date = CURRENT_DATE"
-   export PG_HOST=<db>.rds.amazonaws.com
-   export PG_PASSWORD=***
-   export SCORER_IMAGE_URI="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${IMAGE_TAG}"
-   # Optional operating knobs (defaults shown):
-   #   FLAG_THRESHOLD=0.7  MAX_DOWNLOAD_WORKERS=64  WINDOW_SIZE=800  IMAGENET_NORMALIZE=true
-   ./provision-stack.sh
-   ```
+```bash
+cd aws
+AWS_REGION=us-east-2 STAGE=stg STACK_NAME=pod-scoring-stg ./teardown.sh
+#   KEEP_DATABASE=true   leave pod_scores alone
+#   KEEP_ECR=true        keep the repository and its images
+```
+
+It asks you to type the stack name before doing anything. The VPC, the RDS
+instance, `pod_manual_verification` and the CircleCI contexts are left alone —
+they belong to the platform, not to this service.
 
 ## Routine updates
 
