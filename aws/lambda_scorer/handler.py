@@ -80,35 +80,44 @@ PG_DATABASE = os.environ.get("PG_DATABASE", "pod_classifier")
 PG_USER = os.environ.get("PG_USER", "postgres")
 PG_PASSWORD = os.environ.get("PG_PASSWORD", "")
 
-# Source of the day's POD rows: a SQL query run against Postgres. It must return
-# an AWB column, a trip-id column, and a column of POD image link(s) named one of
-# POD / pod / pod_link (comma-separated links are expanded). The source DB falls
-# back to the results DB unless SOURCE_PG_* is set separately.
+# Source of the POD rows: SQL run against Postgres, returning an AWB column, a
+# trip-id column, and a column of POD image link(s) named one of POD / pod /
+# pod_link (comma-separated links are expanded).
+#
+# The source lives in a different DATABASE from the results: POD rows come from
+# `kaptaan` in the application database, while pod_scores is written wherever
+# PG_DATABASE points. Postgres cannot query across databases on one connection,
+# so fetch_pod_data() dials its own using SOURCE_PG_* — each of which inherits
+# the PG_* value when left empty, so pointing at a sibling database on the same
+# cluster means setting SOURCE_PG_DATABASE alone.
 SOURCE_QUERY = os.environ.get("SOURCE_QUERY", "")
 
 # Single-trip mode: SQL run with a named %(trip_id)s parameter to resolve one
 # trip's POD rows. Same column contract as SOURCE_QUERY.
 TRIP_QUERY = os.environ.get(
     "TRIP_QUERY",
-    "SELECT awb, trip_id, pod FROM pod_manual_verification WHERE trip_id = %(trip_id)s",
+    "SELECT awb, trip_id, pod FROM kaptaan WHERE trip_id = %(trip_id)s",
 )
 
 # Batch/backfill over an explicit date range: bound as named parameters.
 RANGE_QUERY = os.environ.get(
     "RANGE_QUERY",
-    "SELECT awb, trip_id, pod FROM pod_manual_verification "
-    "WHERE created_date BETWEEN %(start_date)s AND %(end_date)s",
+    "SELECT awb, trip_id, pod FROM kaptaan "
+    "WHERE tour_date BETWEEN %(start_date)s AND %(end_date)s",
 )
 
 # Ad-hoc SQL carried in the trigger event (admin API). Validated by
 # _validate_adhoc_query before it is ever sent to Postgres.
 ALLOW_ADHOC_QUERY = os.environ.get("ALLOW_ADHOC_QUERY", "true").lower() == "true"
 
-SOURCE_PG_HOST = os.environ.get("SOURCE_PG_HOST", PG_HOST)
-SOURCE_PG_PORT = os.environ.get("SOURCE_PG_PORT", PG_PORT)
-SOURCE_PG_DATABASE = os.environ.get("SOURCE_PG_DATABASE", PG_DATABASE)
-SOURCE_PG_USER = os.environ.get("SOURCE_PG_USER", PG_USER)
-SOURCE_PG_PASSWORD = os.environ.get("SOURCE_PG_PASSWORD", PG_PASSWORD)
+# `or` rather than a get() default on purpose: CloudFormation always sets these
+# env vars, empty when unset, and an empty string must inherit the results-DB
+# value instead of blanking it.
+SOURCE_PG_HOST = os.environ.get("SOURCE_PG_HOST") or PG_HOST
+SOURCE_PG_PORT = os.environ.get("SOURCE_PG_PORT") or PG_PORT
+SOURCE_PG_DATABASE = os.environ.get("SOURCE_PG_DATABASE") or PG_DATABASE
+SOURCE_PG_USER = os.environ.get("SOURCE_PG_USER") or PG_USER
+SOURCE_PG_PASSWORD = os.environ.get("SOURCE_PG_PASSWORD") or PG_PASSWORD
 
 # Model / scoring.
 MODEL_PATH = os.environ.get("MODEL_PATH", "/opt/model/best.pt")

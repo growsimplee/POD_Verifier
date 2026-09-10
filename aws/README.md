@@ -160,7 +160,7 @@ curl -X POST "$SARATHY/trip/pod-verification/trigger-scoring" \
 
 curl -X POST "$SARATHY/trip/pod-verification/trigger-scoring" \
   -H 'Content-Type: application/json' \
-  -d '{"query": "SELECT awb, trip_id, pod FROM pod_manual_verification WHERE node_id = 42"}'
+  -d '{"query": "SELECT awb, trip_id, pod FROM kaptaan WHERE node_id = 42"}'
 ```
 
 The API validates the selection and invokes the Lambda asynchronously, so `200`
@@ -175,6 +175,18 @@ aws lambda invoke --function-name pod-pipeline-stg --payload '{}' out.json
 ```
 
 The schedule ships as `State: DISABLED` (cron `25 18` UTC / 23:55 IST) in `stack.yaml`.
+
+## Where the data lives
+
+Both halves sit in the **sarathy** database on the shared cluster: `kaptaan`
+supplies the POD rows (`awb`, `trip_id`, `pod`, `tour_date`, `metadata`), and
+`pod_scores` is created beside it by the migrate event. One connection serves
+both, so `SOURCE_PG_*` stays unset — those parameters exist only for the case
+where the source rows move to a different database than the scores.
+
+In CI the connection comes from the org context's own names, mapped in
+`configure-aws`: `DBHOST`, `DB_PASSWORD`, `DBPORT`, `DB_USERNAME` and
+`SARATHY_DBNAME`. Nothing needs duplicating under `PG_*`.
 
 ## Bootstrapping
 

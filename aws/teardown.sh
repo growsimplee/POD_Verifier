@@ -140,7 +140,7 @@ cat <<EOF
 
   Left alone on purpose — these belong to the platform, not to this service:
     · the VPC, its subnets and NAT
-    · the RDS instance and the pod_manual_verification table
+    · the RDS instance, the sarathy database and the kaptaan table
     · the CircleCI contexts and their credentials
     · Sarathy's aws.lambda.podverificationlambda setting
 

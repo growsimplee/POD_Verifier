@@ -9,9 +9,10 @@
 #   export STAGE=prod
 #   export VPC_ID=vpc-xxx
 #   export SUBNET_IDS=subnet-a,subnet-b
-#   export SOURCE_QUERY="SELECT awb, trip_id, pod FROM pod_manual_verification WHERE created_date = CURRENT_DATE"
+#   # all three queries have defaults; override only to change what is scored:
+#   export SOURCE_QUERY="SELECT awb, trip_id, pod FROM kaptaan WHERE tour_date = CURRENT_DATE"
 #   # optional, has a sane default; MUST keep the %(trip_id)s placeholder:
-#   export TRIP_QUERY="SELECT awb, trip_id, pod FROM pod_manual_verification WHERE trip_id = %(trip_id)s"
+#   export TRIP_QUERY="SELECT awb, trip_id, pod FROM kaptaan WHERE trip_id = %(trip_id)s"
 #   # optional: IAM principal (Sarathy) allowed to invoke the function
 #   export INVOKER_PRINCIPAL_ARNS=arn:aws:iam::123456789012:role/sarathy-task-role
 #   export PG_HOST=db.xxx.rds.amazonaws.com
@@ -21,6 +22,7 @@
 # Optional: TRIP_QUERY RANGE_QUERY ALLOW_ADHOC_QUERY RESCORE_LOOKBACK_DAYS
 #           TRIP_MAX_DOWNLOAD_WORKERS WARM_POOL_SIZE WARMUP_RATE
 #           LOG_RETENTION_DAYS ALARM_EMAIL
+#           SOURCE_PG_HOST SOURCE_PG_DATABASE SOURCE_PG_USER SOURCE_PG_PASSWORD
 #           INVOKER_PRINCIPAL_ARNS RESERVED_CONCURRENCY FLAG_THRESHOLD
 #           INFERENCE_BATCH_SIZE MAX_DOWNLOAD_WORKERS WINDOW_SIZE IMAGENET_NORMALIZE
 #           PG_PORT PG_DATABASE PG_USER TMP_EPHEMERAL_MB
@@ -35,9 +37,9 @@ STACK_NAME="${STACK_NAME:-pod-scoring-stg}"
 STAGE="${STAGE:-stg}"
 VPC_ID="${VPC_ID:-}"
 SUBNET_IDS="${SUBNET_IDS:-}"
-SOURCE_QUERY="${SOURCE_QUERY:-}"
-TRIP_QUERY="${TRIP_QUERY:-SELECT awb, trip_id, pod FROM pod_manual_verification WHERE trip_id = %(trip_id)s}"
-RANGE_QUERY="${RANGE_QUERY:-SELECT awb, trip_id, pod FROM pod_manual_verification WHERE created_date BETWEEN %(start_date)s AND %(end_date)s}"
+SOURCE_QUERY="${SOURCE_QUERY:-SELECT awb, trip_id, pod FROM kaptaan WHERE tour_date = CURRENT_DATE}"
+TRIP_QUERY="${TRIP_QUERY:-SELECT awb, trip_id, pod FROM kaptaan WHERE trip_id = %(trip_id)s}"
+RANGE_QUERY="${RANGE_QUERY:-SELECT awb, trip_id, pod FROM kaptaan WHERE tour_date BETWEEN %(start_date)s AND %(end_date)s}"
 ALLOW_ADHOC_QUERY="${ALLOW_ADHOC_QUERY:-true}"
 RESCORE_LOOKBACK_DAYS="${RESCORE_LOOKBACK_DAYS:-30}"
 TRIP_MAX_DOWNLOAD_WORKERS="${TRIP_MAX_DOWNLOAD_WORKERS:-8}"
@@ -57,15 +59,15 @@ PG_PASSWORD="${PG_PASSWORD:-}"
 PG_PORT="${PG_PORT:-5432}"
 PG_DATABASE="${PG_DATABASE:-pod_classifier}"
 PG_USER="${PG_USER:-postgres}"
+SOURCE_PG_HOST="${SOURCE_PG_HOST:-}"
+SOURCE_PG_DATABASE="${SOURCE_PG_DATABASE:-}"
+SOURCE_PG_USER="${SOURCE_PG_USER:-}"
+SOURCE_PG_PASSWORD="${SOURCE_PG_PASSWORD:-}"
 TMP_EPHEMERAL_MB="${TMP_EPHEMERAL_MB:-512}"   # in-memory design uses no /tmp
 SCORER_IMAGE_URI="${SCORER_IMAGE_URI:-}"
 
 if [[ -z "$VPC_ID" || -z "$SUBNET_IDS" ]]; then
   echo "Set VPC_ID and SUBNET_IDS (comma-separated private subnets)." >&2
-  exit 1
-fi
-if [[ -z "$SOURCE_QUERY" ]]; then
-  echo "Set SOURCE_QUERY (SQL returning awb, trip_id, and POD links)." >&2
   exit 1
 fi
 if [[ "$TRIP_QUERY" != *"%(trip_id)s"* ]]; then
@@ -113,6 +115,10 @@ OVERRIDES=(
   "PgPort=${PG_PORT}"
   "PgDatabase=${PG_DATABASE}"
   "PgUser=${PG_USER}"
+  "SourcePgHost=${SOURCE_PG_HOST}"
+  "SourcePgDatabase=${SOURCE_PG_DATABASE}"
+  "SourcePgUser=${SOURCE_PG_USER}"
+  "SourcePgPassword=${SOURCE_PG_PASSWORD}"
   "VpcId=${VPC_ID}"
   "SubnetIds=${SUBNET_IDS}"
   "ScorerImageUri=${SCORER_IMAGE_URI}"

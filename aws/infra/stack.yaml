@@ -14,14 +14,17 @@ Parameters:
 
   SourceQuery:
     Type: String
+    Default: "SELECT awb, trip_id, pod FROM kaptaan WHERE tour_date = CURRENT_DATE"
     Description: >
       Backfill/batch only. SQL run against Postgres to read the day's POD rows.
       Must return an AWB column, a trip-id column, and a POD-links column
-      (POD / pod / pod_link; comma-separated links are expanded).
+      (POD / pod / pod_link; comma-separated links are expanded). Same shape as
+      TripQuery and RangeQuery, and defaulted here for the same reason — a query
+      is code, so it belongs in review rather than in a CI settings form.
 
   TripQuery:
     Type: String
-    Default: "SELECT awb, trip_id, pod FROM pod_manual_verification WHERE trip_id = %(trip_id)s"
+    Default: "SELECT awb, trip_id, pod FROM kaptaan WHERE trip_id = %(trip_id)s"
     Description: >
       Single-trip (event-driven) query. Same column contract as SourceQuery, and
       MUST keep the named %(trip_id)s placeholder — it is bound as a query
@@ -30,7 +33,7 @@ Parameters:
 
   RangeQuery:
     Type: String
-    Default: "SELECT awb, trip_id, pod FROM pod_manual_verification WHERE created_date BETWEEN %(start_date)s AND %(end_date)s"
+    Default: "SELECT awb, trip_id, pod FROM kaptaan WHERE tour_date BETWEEN %(start_date)s AND %(end_date)s"
     Description: >
       Backfill by date range, used when the trigger event carries start_date /
       end_date. MUST keep the named %(start_date)s and %(end_date)s placeholders —
@@ -124,6 +127,32 @@ Parameters:
   PgUser:
     Type: String
     Default: postgres
+
+  # Where the POD rows are READ from. Each of these inherits the PgX value above
+  # when left empty. The common case is a sibling database on the same cluster
+  # (POD rows in `kaptaan` in the app database, scores written elsewhere), which
+  # needs SourcePgDatabase alone — Postgres cannot cross databases on a single
+  # connection, so the handler dials a second one.
+  SourcePgHost:
+    Type: String
+    Default: ""
+    Description: Source DB endpoint. Empty = same as PgHost.
+
+  SourcePgDatabase:
+    Type: String
+    Default: ""
+    Description: Source database name (e.g. sarathy). Empty = same as PgDatabase.
+
+  SourcePgUser:
+    Type: String
+    Default: ""
+    Description: Empty = same as PgUser.
+
+  SourcePgPassword:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Empty = same as PgPassword.
 
   PgPassword:
     Type: String
@@ -261,6 +290,10 @@ Resources:
           PG_DATABASE: !Ref PgDatabase
           PG_USER: !Ref PgUser
           PG_PASSWORD: !Ref PgPassword
+          SOURCE_PG_HOST: !Ref SourcePgHost
+          SOURCE_PG_DATABASE: !Ref SourcePgDatabase
+          SOURCE_PG_USER: !Ref SourcePgUser
+          SOURCE_PG_PASSWORD: !Ref SourcePgPassword
           MODEL_PATH: /opt/model/best.pt
           INPUT_SIZE: "224"
 

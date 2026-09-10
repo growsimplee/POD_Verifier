@@ -47,7 +47,15 @@ fails on the first job naming every one that is missing:
 |---|---|
 | `VPC_ID` | The VPC the function runs in |
 | `SUBNET_IDS` | Comma-separated private subnets, with NAT egress and a route to the RDS |
-| `PG_HOST`, `PG_PASSWORD` | The results + source database |
+
+The database needs nothing added: `DBHOST`, `DB_PASSWORD`, `DBPORT`,
+`DB_USERNAME` and `SARATHY_DBNAME` are already in the org contexts and are
+mapped onto `PG_*` automatically. `pod_scores` is created in the sarathy
+database, beside the `kaptaan` table it reads.
+
+The three queries need nothing added either — `SOURCE_QUERY`, `TRIP_QUERY` and
+`RANGE_QUERY` all default to `kaptaan` in `infra/stack.yaml`. Override one in a
+context only when an environment should score something different.
 
 Credentials come from the org contexts (`Aws-stage`, `Aws-prod`), which name
 them `ACCESS_KEY_ID` / `AWS_ACCESS_KEY`. Those keys were created for sarathy's
@@ -100,7 +108,7 @@ AWS_REGION=us-east-2 STAGE=stg STACK_NAME=pod-scoring-stg ./teardown.sh
 ```
 
 It asks you to type the stack name before doing anything. The VPC, the RDS
-instance, `pod_manual_verification` and the CircleCI contexts are left alone —
+instance, `kaptaan` and the CircleCI contexts are left alone —
 they belong to the platform, not to this service.
 
 ## Routine updates

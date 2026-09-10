@@ -581,7 +581,7 @@ def test_resolve_batch_source_rejects_bad_ranges(event):
 def test_adhoc_query_accepts_read_only_sql(monkeypatch):
     monkeypatch.setattr(H, "ALLOW_ADHOC_QUERY", True, raising=False)
     sql, params, source = H.resolve_batch_source(
-        {"query": "SELECT awb, trip_id, pod FROM pod_manual_verification WHERE awb = 'X';"})
+        {"query": "SELECT awb, trip_id, pod FROM kaptaan WHERE awb = 'X';"})
     assert source == "adhoc_query" and params is None
     assert sql.endswith("'X'")            # trailing semicolon stripped
     assert H.resolve_batch_source({"query": "WITH x AS (SELECT 1) SELECT * FROM x"})[2] == "adhoc_query"
@@ -729,3 +729,56 @@ def test_migrate_wins_over_the_other_lanes(wire, schema_file, monkeypatch):
     body = json.loads(H.handler(
         {"migrate": True, "trip_id": 5}, FakeContext(900_000))["body"])
     assert body["status"] == "applied"
+
+
+# --------------------------------------------------------------------------- #
+# Source database resolution
+# --------------------------------------------------------------------------- #
+
+def _reload_with(monkeypatch, **env):
+    """Re-import the handler with a given environment (module-level config)."""
+    import importlib
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    return importlib.reload(H)
+
+
+def test_source_db_inherits_results_db_when_unset(monkeypatch):
+    m = _reload_with(monkeypatch, PG_HOST="db.internal", PG_DATABASE="pod_classifier",
+                     PG_USER="postgres", PG_PASSWORD="pw",
+                     SOURCE_PG_HOST="", SOURCE_PG_DATABASE="",
+                     SOURCE_PG_USER="", SOURCE_PG_PASSWORD="")
+    try:
+        # CloudFormation always sets these, empty when unset — empty must inherit
+        # rather than blank the connection out.
+        assert m.SOURCE_PG_HOST == "db.internal"
+        assert m.SOURCE_PG_DATABASE == "pod_classifier"
+        assert m.SOURCE_PG_USER == "postgres"
+        assert m.SOURCE_PG_PASSWORD == "pw"
+    finally:
+        importlib_reload_clean(monkeypatch)
+
+
+def test_source_db_can_be_a_sibling_database_on_the_same_cluster(monkeypatch):
+    """The real shape: POD rows in `kaptaan` in the app DB, scores written apart."""
+    m = _reload_with(monkeypatch, PG_HOST="db.internal", PG_DATABASE="pod_classifier",
+                     PG_USER="postgres", PG_PASSWORD="pw",
+                     SOURCE_PG_HOST="", SOURCE_PG_DATABASE="sarathy",
+                     SOURCE_PG_USER="", SOURCE_PG_PASSWORD="")
+    try:
+        assert m.SOURCE_PG_DATABASE == "sarathy"      # the one thing that differs
+        assert m.SOURCE_PG_HOST == "db.internal"      # same cluster
+        assert m.SOURCE_PG_PASSWORD == "pw"           # same credentials
+        assert m.PG_DATABASE == "pod_classifier"      # results stay put
+    finally:
+        importlib_reload_clean(monkeypatch)
+
+
+def importlib_reload_clean(monkeypatch):
+    """Restore the module to the ambient test environment."""
+    import importlib
+    for k in ("PG_HOST", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
+              "SOURCE_PG_HOST", "SOURCE_PG_DATABASE",
+              "SOURCE_PG_USER", "SOURCE_PG_PASSWORD"):
+        monkeypatch.delenv(k, raising=False)
+    importlib.reload(H)

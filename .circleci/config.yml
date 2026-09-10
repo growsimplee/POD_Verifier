@@ -40,9 +40,24 @@
 #
 # Each context must ALSO provide these, which are specific to this service and
 # will not already be there:
-#   VPC_ID                  vpc-…
-#   SUBNET_IDS              subnet-a,subnet-b  (NAT egress + a route to the RDS)
-#   PG_HOST, PG_PASSWORD    results + source database
+#   VPC_ID        vpc-…
+#   SUBNET_IDS    subnet-a,subnet-b  (NAT egress + a route to the RDS)
+#
+# The three queries (SOURCE_QUERY, TRIP_QUERY, RANGE_QUERY) are NOT context
+# variables: they default to kaptaan in infra/stack.yaml. Override one in a
+# context only to make an environment score something different.
+#
+# The database is NOT one of them: configure-aws maps the org's existing
+# variables onto the ones the scripts expect —
+#
+#   DBHOST         -> PG_HOST        DBPORT      -> PG_PORT
+#   DB_PASSWORD    -> PG_PASSWORD    DB_USERNAME -> PG_USER
+#   SARATHY_DBNAME -> PG_DATABASE
+#
+# pod_scores is created in the sarathy database, beside the kaptaan table it
+# reads from, so a single connection serves both and SOURCE_PG_* stays unset.
+# Setting any PG_* explicitly overrides the mapping; set SOURCE_PG_DATABASE
+# only if the POD rows ever move to a different database than the scores.
 #
 # Optional, per context:
 #   SOURCE_QUERY TRIP_QUERY RANGE_QUERY ALLOW_ADHOC_QUERY RESCORE_LOOKBACK_DAYS
@@ -141,6 +156,21 @@ commands:
               echo "export AWS_ACCESS_KEY_ID=\"${KEY_ID}\""
               echo "export AWS_SECRET_ACCESS_KEY=\"${SECRET}\""
             } >> "$BASH_ENV"
+            # The org already carries the database on its own names — one
+            # DBHOST cluster with a database per service (SARATHY_DBNAME,
+            # LOGISTIC_DBNAME, …). Reuse them rather than duplicating the
+            # credentials under PG_*; an explicit PG_* still wins if set.
+            {
+              [ -n "${PG_HOST:-}" ]     || [ -z "${DBHOST:-}" ]      || echo "export PG_HOST=\"${DBHOST}\""
+              [ -n "${PG_PASSWORD:-}" ] || [ -z "${DB_PASSWORD:-}" ] || echo "export PG_PASSWORD=\"${DB_PASSWORD}\""
+              [ -n "${PG_PORT:-}" ]     || [ -z "${DBPORT:-}" ]      || echo "export PG_PORT=\"${DBPORT}\""
+              [ -n "${PG_USER:-}" ]     || [ -z "${DB_USERNAME:-}" ] || echo "export PG_USER=\"${DB_USERNAME}\""
+              # pod_scores lives in the sarathy database, alongside kaptaan which
+              # it reads. Same database for both, so one connection does it and
+              # SOURCE_PG_* stays unset.
+              [ -n "${PG_DATABASE:-}" ] || [ -z "${SARATHY_DBNAME:-}" ] || echo "export PG_DATABASE=\"${SARATHY_DBNAME}\""
+            } >> "$BASH_ENV"
+
             command -v aws >/dev/null 2>&1 || {
               echo "Installing AWS CLI v2"
               curl -sS "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
@@ -166,11 +196,27 @@ commands:
               exit 1
             fi
             echo "Context complete for ${STAGE} in ${AWS_REGION}."
+            echo "Database: ${PG_HOST} / ${PG_DATABASE:-pod_classifier} as ${PG_USER:-postgres}"
             echo "Deploying as: $(aws sts get-caller-identity --query Arn --output text)"
             case "${SUBNET_IDS}" in
               *,*) : ;;
               *) echo "WARNING: SUBNET_IDS has a single subnet — no AZ redundancy." ;;
             esac
+            # The org contexts set AWS_ACCOUNT_ID, and deploy.sh trusts it
+            # verbatim rather than calling sts. A value from the wrong context
+            # would push the image to another account's registry, so verify it
+            # against the credentials actually in play.
+            if [ -n "${AWS_ACCOUNT_ID:-}" ]; then
+              REAL="$(aws sts get-caller-identity --query Account --output text)"
+              if [ "${AWS_ACCOUNT_ID}" != "${REAL}" ]; then
+                echo "AWS_ACCOUNT_ID=${AWS_ACCOUNT_ID} but these credentials are for ${REAL}."
+                echo "The context and the credentials disagree — refusing to deploy."
+                exit 1
+              fi
+              echo "AWS_ACCOUNT_ID matches the active credentials (${REAL})."
+            fi
+            [ -z "${SCORER_IMAGE_URI:-}" ] || \
+              echo "WARNING: SCORER_IMAGE_URI is preset — CI derives this itself."
 
 jobs:
   # Builds the exact image that ships, then runs the handler suite inside it so
