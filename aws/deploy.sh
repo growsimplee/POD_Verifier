@@ -5,12 +5,12 @@
 # at an image; this script only has to get the image into ECR.
 #
 # Handler: event-driven per-trip scorer (Sarathy invokes it when a rider raises a
-# POD verification request), plus batch modes for backfills and a {"migrate": true}
-# bootstrap that applies infra/schema.sql from inside the VPC.
+# POD verification request), plus batch modes for backfills. The function holds
+# no database credentials — it reads rows from and writes scores back to
+# sarathy's /internal/pod-scoring API, which owns the pod_scores table.
 #
 # Everything here is idempotent, so CI can run it on a completely empty account:
 #   * the ECR repository is created when missing
-#   * infra/schema.sql is staged into the build context (single source of truth)
 #   * the Lambda update is skipped automatically when the function does not exist yet
 #
 # Local build smoke-test without AWS credentials:
@@ -29,16 +29,6 @@ if [[ ! -f "${CTX}/model/best.pt" ]]; then
   echo "ERROR: ${CTX}/model/best.pt not found. Commit/copy the trained checkpoint first." >&2
   exit 1
 fi
-
-# Stage the schema into the Docker build context. infra/schema.sql stays the one
-# copy anybody edits; the file in lambda_scorer/ is generated and gitignored.
-SCHEMA_SRC="${AWS_DIR}/infra/schema.sql"
-if [[ ! -f "${SCHEMA_SRC}" ]]; then
-  echo "ERROR: ${SCHEMA_SRC} not found — it is baked in for the migrate event." >&2
-  exit 1
-fi
-cp "${SCHEMA_SRC}" "${CTX}/schema.sql"
-echo "==> staged infra/schema.sql into the build context"
 
 AWS_REGION="${AWS_REGION:-us-east-2}"
 STAGE="${STAGE:-stg}"

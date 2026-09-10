@@ -21,21 +21,19 @@ They then appear in the **Test** dropdown for anyone with access to the function
 | Event | Effect |
 |---|---|
 | `score-one-trip` | Scores one trip. **Edit `trip_id` before running.** The live path — identical to what Sarathy sends. |
-| `score-one-trip-with-links` | Same, but supplies the POD links directly. Use when the `kaptaan` row does not exist yet, or to test against a specific image. |
-| `backfill-date-range` | Re-scores everything in a date range, via `RANGE_QUERY`. |
-| `backfill-query` | Re-scores whatever a read-only `SELECT` returns. |
-| `backfill-full-sweep` | The whole `SOURCE_QUERY` dataset — what the disabled daily schedule sends. |
+| `score-one-trip-with-links` | Same, but supplies the POD links directly. Use to test against a specific image. Supply `awb` too, or the handler still calls sarathy to resolve it. |
+| `backfill-date-range` | Re-scores every trip whose POD was captured in a date range. |
+| `backfill-today` | Today's PODs — the empty event, and what the disabled daily schedule sends. |
 | `warmup` | Loads the model and returns. Scores nothing, writes nothing. Safe anywhere. |
-| `migrate-apply-schema` | Applies `infra/schema.sql`. Idempotent — CI runs it on every deploy. |
 
-Re-running any scoring event is safe: links already scored within
-`RESCORE_LOOKBACK_DAYS` are skipped, and writes upsert on
-`(awb, pod_link, run_date)`.
+Re-running any scoring event is safe: sarathy reports which links already carry
+a score and those are not re-downloaded, and the write upserts on
+`(awb, podLink, runDate)`.
 
 ## Two things to know before clicking Test
 
 **The console invokes synchronously.** It waits for the response, so a
-`backfill-full-sweep` can hold the tab for up to the 15-minute function timeout,
+`backfill-date-range` can hold the tab for up to the 15-minute function timeout,
 and the browser may give up before the run does — the run still completes. For
 anything batch-sized, prefer an async CLI invoke and watch the logs:
 
@@ -54,12 +52,21 @@ easy way to run the wrong one.
 
 ## What is deliberately not here
 
-There is no test event for the destructive schema drop
-(`{"migrate": "drop", …}`). It is a one-click action in a dropdown next to
-routine ones, and the whole point of the confirmation token is that dropping the
-table should be awkward. `aws/teardown.sh` builds that payload when it needs it.
+**No schema events.** There used to be a `migrate-apply-schema` and a matching
+destructive drop. `pod_scores` is sarathy's table now, created by sarathy's
+Flyway migration `V198__pod_scores.sql`, and this function has no database
+access at all — so neither event has anything to do.
+
+**No ad-hoc SQL event.** The scorer cannot run a query; it asks sarathy for a
+trip or a date range. If a backfill needs a different selection than "captured
+between these dates", that belongs in sarathy's
+`GET /internal/pod-scoring/trips`, in review, rather than in a payload pasted
+into a console field.
 
 ## Checking the result
+
+The scores land in sarathy's database, so read them from sarathy or Metabase —
+this function has no connection of its own:
 
 ```sql
 SELECT status, count(*), max(scored_at)
