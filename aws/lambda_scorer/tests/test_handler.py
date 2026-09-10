@@ -394,8 +394,11 @@ def test_event_links_win_over_the_derived_table(wire, monkeypatch):
     }, FakeContext(900_000))["body"])
 
     assert body["source"] == "event_payload"
+    # the event's link is scored, not the table's
     assert [r["pod_link"] for r in wire.upserted] == ["http://img/fresh.png"]
-    assert called["n"] == 0, "the derived table should not even be consulted"
+    # ...but the AWB is still taken from the table, since the event has none
+    assert [r["awb"] for r in wire.upserted] == ["A1"]
+    assert called["n"] == 1
 
 
 def test_single_trip_falls_back_to_event_links(wire, monkeypatch):
@@ -896,3 +899,48 @@ def test_source_connection_is_closed_before_the_slow_work(monkeypatch):
     monkeypatch.setattr(H, "_connect", lambda *a, **k: conn)
     H.fetch_pod_data("SELECT awb, trip_id, pod FROM kaptaan")
     assert conn.closed == 1
+
+
+def test_event_awb_is_used_as_is_without_a_lookup(wire, monkeypatch):
+    called = {"n": 0}
+
+    def _counted(tid):
+        called["n"] += 1
+        return pd.DataFrame()
+
+    monkeypatch.setattr(H, "fetch_trip_pod_data", _counted)
+    monkeypatch.setattr(H, "build_session", lambda *a, **k: FakeSession())
+
+    H.handler({"trip_id": 91, "awb": "GS123", "pod_links": ["http://img/a.png"]},
+              FakeContext(900_000))
+
+    assert [r["awb"] for r in wire.upserted] == ["GS123"]
+    assert called["n"] == 0, "nothing to resolve — the caller supplied the AWB"
+
+
+def test_awb_is_resolved_from_the_trip_table_when_the_event_omits_it(wire, monkeypatch):
+    """Sarathy sends links but no AWB; TRIP-<id> would join to nothing."""
+    monkeypatch.setattr(H, "build_session", lambda *a, **k: FakeSession())
+    monkeypatch.setattr(H, "fetch_trip_pod_data", lambda tid: pd.DataFrame([
+        {"awb": "GS4321728395", "trip_id": tid, "pod": "http://img/from_table.png"},
+    ]))
+
+    body = json.loads(H.handler({
+        "trip_id": 116126,
+        "pod_links": ["http://img/1.webp", "http://img/2.webp"],
+    }, FakeContext(900_000))["body"])
+
+    assert body["source"] == "event_payload"
+    assert body["scored"] == 2
+    assert {r["awb"] for r in wire.upserted} == {"GS4321728395"}
+    assert {r["pod_link"] for r in wire.upserted} == {
+        "http://img/1.webp", "http://img/2.webp"}
+
+
+def test_placeholder_awb_survives_when_the_trip_row_is_gone(wire, monkeypatch):
+    """Nothing to resolve from — the row must still be written, keyed on the trip."""
+    monkeypatch.setattr(H, "build_session", lambda *a, **k: FakeSession())
+    monkeypatch.setattr(H, "fetch_trip_pod_data", lambda tid: pd.DataFrame())
+
+    H.handler({"trip_id": 92, "pod_links": ["http://img/a.png"]}, FakeContext(900_000))
+    assert [r["awb"] for r in wire.upserted] == ["TRIP-92"]

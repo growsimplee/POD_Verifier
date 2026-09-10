@@ -798,25 +798,33 @@ def handle_single_trip(event: dict, context: Any) -> dict:
     if not PG_HOST or not PG_PASSWORD:
         return {"statusCode": 500, "body": json.dumps({"error": "Missing Postgres config"})}
 
-    # The event carries the trip's POD links as they were at the instant the
-    # rider raised the request. TRIP_QUERY reads `kaptaan`, which a pipeline
-    # derives from that same trip table and therefore lags it. For one trip the
-    # fresher source has to win: a rider who replaced a photo and re-raised the
-    # request would otherwise have the *old* photo scored, and only on prod,
-    # where kaptaan is actually populated.
+    # Links and AWB come from different places on purpose.
+    #
+    # Links: the event carries them as they were at the instant the rider raised
+    # the request, so it wins. TRIP_QUERY is the fallback for a caller that only
+    # knows the trip id — a console test event, say.
+    #
+    # AWB: the event does not carry one, and a TRIP-<id> placeholder joins to
+    # nothing downstream — pod_scores_flagged groups by AWB. So resolve it from
+    # the trip table even when the links came from the event. That is one
+    # indexed lookup on the primary key; cheap enough to be worth a real AWB.
+    event_awb = str(event.get("awb") or "").strip()
     rows = rows_from_event(event, trip_id)
     source = "event_payload"
 
-    if not rows and TRIP_QUERY:
-        # Nothing in the event — a console invoke carrying only a trip_id, or a
-        # caller that does not know the links. Fall back to the derived table.
+    if TRIP_QUERY and (not rows or not event_awb):
         try:
             raw = fetch_trip_pod_data(trip_id)
-            if not raw.empty:
-                rows = expand_pod_links(raw).to_dict("records")
-                source = "trip_query"
-        except Exception as e:  # noqa: BLE001 — nothing left to try
-            logger.warning("TRIP_QUERY fallback failed for trip %s: %s", trip_id, e)
+            resolved = expand_pod_links(raw).to_dict("records") if not raw.empty else []
+            if resolved:
+                if not rows:
+                    rows, source = resolved, "trip_query"
+                elif not event_awb:
+                    # Keep the event's links, take only the AWB.
+                    for r in rows:
+                        r["awb"] = resolved[0]["awb"]
+        except Exception as e:  # noqa: BLE001 — links from the event still stand
+            logger.warning("TRIP_QUERY lookup failed for trip %s: %s", trip_id, e)
 
     if not rows:
         logger.warning("No POD links for trip %s (run=%s)", trip_id, run_id)
