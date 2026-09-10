@@ -51,7 +51,7 @@ fails on the first job naming every one that is missing:
 |---|---|
 | `VPC_ID` | The VPC the function runs in |
 | `SUBNET_IDS` | Comma-separated private subnets, with NAT egress and a route to sarathy |
-| `SARATHY_BASE_URL` | Sarathy's internal API base, e.g. `http://sarathy.internal:8080` |
+| `SARATHY_BASE_URL` | Sarathy on the internal NLB, port 9001 — the same address logistic uses. Stage: `http://grow-simplee-nlb-staging-0dff0c43a1132f00.elb.us-east-2.amazonaws.com:9001`; prod: `http://grow-simplee-nlb-prod-a264c46571856f67.elb.ap-south-1.amazonaws.com:9001` |
 
 `SARATHY_BASE_URL` must resolve and route from `SUBNET_IDS`, and **must not be
 publicly reachable**: `/internal/pod-scoring` is protected by network isolation
@@ -117,7 +117,7 @@ cd aws && chmod +x deploy.sh provision-stack.sh teardown.sh
 export AWS_REGION=ap-south-1 STAGE=prod STACK_NAME=pod-scoring-prod
 export ECR_REPOSITORY=pod-pipeline IMAGE_TAG=$(git rev-parse --short=12 HEAD)
 export VPC_ID=vpc-xxx SUBNET_IDS=subnet-a,subnet-b
-export SARATHY_BASE_URL=http://sarathy.internal:8080
+export SARATHY_BASE_URL=http://grow-simplee-nlb-prod-a264c46571856f67.elb.ap-south-1.amazonaws.com:9001
 export INVOKER_PRINCIPAL_ARNS=arn:aws:iam::<acct>:role/<sarathy-prod-role>
 
 SKIP_LAMBDA_UPDATE=true ./deploy.sh          # creates the ECR repo, pushes

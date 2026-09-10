@@ -114,11 +114,25 @@ Runtime env (set by CloudFormation, not baked into code): **sarathy**
 and **resilience** (`CONTINUATION_SAFETY_MS`, `MAX_CONTINUATIONS`). See
 [`config.env.example`](config.env.example).
 
-`SARATHY_BASE_URL` must resolve and route from the Lambda's subnets and **must
-not be publicly reachable**: `/internal/pod-scoring` is protected by network
-isolation alone and carries no app-level token, in the same way as the rest of
-sarathy's service-to-service surface. There are no database variables to set —
-the de-dup window lives on sarathy as `pod.scoring.rescore-lookback-days`.
+`SARATHY_BASE_URL` is sarathy on the shared **internal** NLB — the same address
+`logistic` uses as `url.sarathy.base`. Sarathy listens on `9001` with no context
+path, so this is scheme, host and port only; the client appends
+`/internal/pod-scoring`.
+
+| | |
+|---|---|
+| stage | `http://grow-simplee-nlb-staging-0dff0c43a1132f00.elb.us-east-2.amazonaws.com:9001` |
+| prod | `http://grow-simplee-nlb-prod-a264c46571856f67.elb.ap-south-1.amazonaws.com:9001` |
+
+It must be the *internal* NLB, which resolves to private addresses only (`10.0.x`
+on stage, `10.10.x` on prod) — `provision-stack.sh` resolves the host and refuses
+a public answer. Sarathy has no app-level auth filter at all (only a request
+logger), so every endpoint on it, these included, is protected by being
+unreachable from outside the VPC. A public address here would therefore expose an
+unauthenticated write to `pod_scores`.
+
+There are no database variables to set — the de-dup window lives on sarathy as
+`pod.scoring.rescore-lookback-days`.
 
 > **Do not disable `IMAGENET_NORMALIZE`.** The model was trained with ImageNet
 > normalization; scoring without it collapses recall.

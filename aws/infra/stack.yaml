@@ -22,10 +22,14 @@ Parameters:
   SarathyBaseUrl:
     Type: String
     Description: >
-      Base URL of sarathy's internal API, reachable from the Lambda's subnets
-      (e.g. http://sarathy.internal:8080). The /internal/pod-scoring endpoints
-      are namespaced for VPC-only access and carry no app-level token, so this
-      MUST NOT be a publicly routable address.
+      Sarathy on the shared internal NLB, reachable from the Lambda's subnets —
+      the same address logistic uses (url.sarathy.base). Sarathy listens on
+      9001 with no context path, so this is scheme, host and port only; the
+      client appends /internal/pod-scoring. It MUST be the INTERNAL NLB: those
+      endpoints carry no app-level token, so a publicly routable address would
+      expose an unauthenticated write to pod_scores.
+      stage: http://grow-simplee-nlb-staging-0dff0c43a1132f00.elb.us-east-2.amazonaws.com:9001
+      prod:  http://grow-simplee-nlb-prod-a264c46571856f67.elb.ap-south-1.amazonaws.com:9001
 
   SarathyTimeout:
     Type: String

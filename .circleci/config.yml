@@ -41,7 +41,8 @@
 # will not already be there:
 #   VPC_ID            vpc-…
 #   SUBNET_IDS        subnet-a,subnet-b  (NAT egress + a route to sarathy)
-#   SARATHY_BASE_URL  http://sarathy.internal:8080
+#   SARATHY_BASE_URL  sarathy on the INTERNAL NLB, port 9001 — the same
+#                     address logistic uses as url.sarathy.base
 #
 # No database variables. This pipeline holds no DB credentials and issues no
 # SQL: the function reads the rows to score from, and writes pod_scores back

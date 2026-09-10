@@ -9,8 +9,8 @@
 #   export STAGE=prod
 #   export VPC_ID=vpc-xxx
 #   export SUBNET_IDS=subnet-a,subnet-b
-#   # sarathy's internal API — this function holds no DB credentials and no SQL
-#   export SARATHY_BASE_URL=http://sarathy.internal:8080
+#   # sarathy on the internal NLB — this function holds no DB credentials, no SQL
+#   export SARATHY_BASE_URL=http://grow-simplee-nlb-staging-0dff0c43a1132f00.elb.us-east-2.amazonaws.com:9001
 #   # optional: IAM principal (Sarathy) allowed to invoke the function
 #   export INVOKER_PRINCIPAL_ARNS=arn:aws:iam::123456789012:role/sarathy-task-role
 #   export SCORER_IMAGE_URI=123456789012.dkr.ecr.ap-south-1.amazonaws.com/pod-pipeline:latest
@@ -63,8 +63,19 @@ if [[ -z "$SARATHY_BASE_URL" ]]; then
   echo "Set SARATHY_BASE_URL (sarathy's internal API base, reachable from SUBNET_IDS)." >&2
   exit 1
 fi
-if [[ "$SARATHY_BASE_URL" == https://* ]] && [[ "$SARATHY_BASE_URL" != *.internal* ]]; then
-  echo "NOTE: /internal/pod-scoring has no app-level auth; SARATHY_BASE_URL must not be publicly routable." >&2
+# /internal/pod-scoring has no app-level auth, so the host must be one that only
+# resolves inside the VPC. Resolve it and check: a public answer means the write
+# endpoint would be reachable from the internet.
+if command -v getent >/dev/null 2>&1; then
+  SARATHY_HOST="${SARATHY_BASE_URL#*://}"; SARATHY_HOST="${SARATHY_HOST%%[:/]*}"
+  SARATHY_IPS="$(getent ahostsv4 "$SARATHY_HOST" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')"
+  case "${SARATHY_IPS:-none}" in
+    none) echo "NOTE: could not resolve ${SARATHY_HOST} from here — verify it is the INTERNAL endpoint." >&2 ;;
+    10.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|192.168.*) : ;;
+    *) echo "REFUSING: ${SARATHY_HOST} resolves to ${SARATHY_IPS}— that is not a private address." >&2
+       echo "          /internal/pod-scoring has no auth; point this at the internal NLB." >&2
+       exit 1 ;;
+  esac
 fi
 if (( WARM_POOL_SIZE >= RESERVED_CONCURRENCY )); then
   echo "WARM_POOL_SIZE ($WARM_POOL_SIZE) must be below RESERVED_CONCURRENCY ($RESERVED_CONCURRENCY)." >&2
