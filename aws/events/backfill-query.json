@@ -1,0 +1,3 @@
+{
+  "query": "SELECT awb, trip_id, pod FROM kaptaan WHERE tour_date = CURRENT_DATE - 1"
+}

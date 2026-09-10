@@ -1,0 +1,7 @@
+{
+  "trip_id": 12345,
+  "awb": "REPLACE-WITH-AWB",
+  "pod_links": [
+    "https://replace-with-a-real-pod-image-url/a.jpg"
+  ]
+}

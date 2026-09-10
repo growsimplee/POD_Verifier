@@ -1,0 +1,4 @@
+{
+  "warmup": true,
+  "fanout": 1
+}

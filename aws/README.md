@@ -141,40 +141,113 @@ cd aws && DRY_RUN=true ./deploy.sh
 
 ## Triggering
 
-Live path — Sarathy invokes it (`InvocationType=Event`) on each POD verification
-request. Manually, the same thing:
+Every mode is one `aws lambda invoke`. Two flags matter:
+`--cli-binary-format raw-in-base64-out` is required on AWS CLI v2, and
+`--invocation-type Event` makes it fire-and-forget. Without `Event` the CLI
+waits for the response — fine for a trip or a warm ping, but a batch sweep can
+run for 15 minutes and the CLI gives up after 60 seconds, so **always use
+`Event` for batch** (or add `--cli-read-timeout 0`).
 
 ```bash
-aws lambda invoke --function-name pod-pipeline-stg \
-  --invocation-type Event \
-  --payload '{"trip_id": 12345}' /dev/null
+FN=pod-pipeline-stg; R=us-east-2
+inv() { aws lambda invoke --function-name "$FN" --region "$R" \
+          --cli-binary-format raw-in-base64-out --payload "$1" "${2:-/dev/stdout}"; }
 ```
 
-Batch runs are normally started from Sarathy's admin API — one selection per
-request, either a date range or a read-only query:
+**One trip** — the live path, identical to what Sarathy sends:
+
+```bash
+inv '{"trip_id": 12345}'
+# links optional; supplied when the source row does not exist yet
+inv '{"trip_id": 12345, "awb": "ABC123", "pod_links": ["https://.../a.jpg"]}'
+```
+
+Returns `status: complete`, or `already_scored` when every link has been scored
+in the last `RESCORE_LOOKBACK_DAYS`. Re-running is safe — it only downloads
+links that are new or changed.
+
+**A date range** (async — this can be long):
+
+```bash
+aws lambda invoke --function-name "$FN" --region "$R" --invocation-type Event \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{"start_date": "2026-09-01", "end_date": "2026-09-09"}' /dev/null
+```
+
+**An arbitrary read-only query:**
+
+```bash
+aws lambda invoke --function-name "$FN" --region "$R" --invocation-type Event \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{"query": "SELECT awb, trip_id, pod FROM kaptaan WHERE tour_date = CURRENT_DATE - 1"}' /dev/null
+```
+
+Must be a single `SELECT`/`WITH`; the connection is opened
+`default_transaction_read_only`, so a write cannot succeed even if the
+validation is wrong. `ALLOW_ADHOC_QUERY=false` refuses the mode entirely.
+
+**The whole `SOURCE_QUERY` dataset** — what the disabled schedule sends:
+
+```bash
+aws lambda invoke --function-name "$FN" --region "$R" --invocation-type Event \
+  --cli-binary-format raw-in-base64-out --payload '{}' /dev/null
+```
+
+**Housekeeping:**
+
+```bash
+inv '{"warmup": true, "fanout": 1}'   # load the model, score nothing
+inv '{"migrate": true}'               # apply schema.sql, idempotent
+```
+
+### From the console
+
+[`events/`](events/) holds a saved payload per mode — score one trip, backfill a
+range, run a query, warm up, migrate. Save them once as *shareable* test events
+on the function and anyone with console access can run one from the Test tab, no
+terminal or local credentials needed. `events/README.md` covers the setup and
+the two gotchas (the console invokes synchronously, and the payloads are
+identical across environments).
+
+### Without AWS credentials
+
+Sarathy's admin API covers the batch modes, for people who should not have
+deploy keys. A `200` means *accepted*, not *scored*.
 
 ```bash
 curl -X POST "$SARATHY/trip/pod-verification/trigger-scoring" \
   -H 'Content-Type: application/json' \
-  -d '{"startDate": "2026-08-01", "endDate": "2026-08-20"}'
+  -d '{"startDate": "2026-09-01", "endDate": "2026-09-09"}'
 
 curl -X POST "$SARATHY/trip/pod-verification/trigger-scoring" \
   -H 'Content-Type: application/json' \
   -d '{"query": "SELECT awb, trip_id, pod FROM kaptaan WHERE node_id = 42"}'
 ```
 
-The API validates the selection and invokes the Lambda asynchronously, so `200`
-means *accepted*, not *scored*. The same guard runs again inside the Lambda —
-`ALLOW_ADHOC_QUERY=false` refuses raw SQL outright, whatever the caller sends.
+Raising a POD verification request the normal way (`/trip/send-pod-verification`)
+also triggers scoring for that trip — that is the live path.
 
-Backfill sweep (the disabled daily schedule):
+### Seeing what happened
 
-```bash
-aws scheduler update-schedule --name pod-scoring-daily-stg --state ENABLED   # or:
-aws lambda invoke --function-name pod-pipeline-stg --payload '{}' out.json
+An async invoke returns nothing, so read the outcome from the table or the logs:
+
+```sql
+SELECT status, count(*), max(scored_at)
+FROM pod_scores WHERE run_date = CURRENT_DATE GROUP BY status;
 ```
 
-The schedule ships as `State: DISABLED` (cron `25 18` UTC / 23:55 IST) in `stack.yaml`.
+```bash
+aws logs tail "/aws/lambda/$FN" --region "$R" --since 15m --follow
+```
+
+### On a schedule
+
+The backfill sweep exists but ships **DISABLED** — per-trip events are the live
+trigger. Its time is set in IST (`BackfillSchedule`, default `cron(15 0 * * ? *)`
+in `Asia/Kolkata` — 00:15 daily), and `BackfillState=ENABLED` turns it on. Read
+the caveats above the resource in `stack.yaml` first: the batch path's resume
+checkpoint is per `run_date`, so a nightly sweep re-scores links that per-trip
+runs already covered on earlier days.
 
 ## Where the data lives
 
