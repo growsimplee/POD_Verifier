@@ -62,6 +62,7 @@ class FakeCursor:
     def __init__(self, conn):
         self.conn = conn
         self._rows = []
+        self.description = [("col",)]
     def __enter__(self):
         return self
     def __exit__(self, *a):
@@ -69,7 +70,11 @@ class FakeCursor:
     def execute(self, sql, params=None):
         self.conn._last_sql = sql
         self.conn.executed.append((sql, params))
-        if "SELECT pod_link FROM pod_scores" in sql:
+        if sql.strip().upper().startswith("SELECT AWB"):
+            # a source query — mirror fetch_pod_data's column contract
+            self.description = [("awb",), ("trip_id",), ("pod",)]
+            self._rows = list(self.conn.done_rows)
+        elif "SELECT pod_link FROM pod_scores" in sql:
             # load_scored_links: only links this trip already scored
             links = set(params["links"]) if params else set()
             self._rows = [(l,) for l in self.conn.scored_links if l in links]
@@ -88,11 +93,16 @@ class FakeConn:
         self.upserted = []
         self.executed = []
         self.committed = 0
+        self.rolled_back = 0
         self.closed = 0
+        self.autocommit = True
+        self.autocommit_history = []
     def cursor(self):
         return FakeCursor(self)
     def commit(self):
         self.committed += 1
+    def rollback(self):
+        self.rolled_back += 1
     def close(self):
         self.closed = 1
 
@@ -782,3 +792,79 @@ def importlib_reload_clean(monkeypatch):
               "SOURCE_PG_USER", "SOURCE_PG_PASSWORD"):
         monkeypatch.delenv(k, raising=False)
     importlib.reload(H)
+
+
+# --------------------------------------------------------------------------- #
+# Locking / session hygiene on a shared operational cluster
+# --------------------------------------------------------------------------- #
+
+def test_transaction_commits_and_restores_autocommit():
+    conn = FakeConn()
+    with H._transaction(conn) as tx:
+        assert tx.autocommit is False        # inside: a real transaction
+    assert conn.committed == 1
+    assert conn.autocommit is True           # out: nothing left open
+
+
+def test_transaction_rolls_back_and_still_restores_autocommit():
+    conn = FakeConn()
+    with pytest.raises(RuntimeError):
+        with H._transaction(conn):
+            raise RuntimeError("boom")
+    assert conn.rolled_back == 1
+    assert conn.committed == 0
+    assert conn.autocommit is True           # never left idle in transaction
+
+
+def test_reads_do_not_open_a_transaction(wire, monkeypatch):
+    """A SELECT must not hold a transaction across downloads and inference."""
+    monkeypatch.setattr(H, "fetch_trip_pod_data", lambda tid: _trip_df("T1", 1))
+    monkeypatch.setattr(H, "build_session", lambda *a, **k: FakeSession())
+
+    H.handler({"trip_id": "T1"}, FakeContext(900_000))
+    # autocommit is only ever toggled off inside upsert_results' transaction,
+    # and is back on afterwards.
+    assert wire.autocommit is True
+
+
+def test_already_scored_path_leaves_no_open_transaction(wire, monkeypatch):
+    """The early return skips the upsert — it must not strand a transaction."""
+    monkeypatch.setattr(H, "fetch_trip_pod_data", lambda tid: _trip_df("T2", 1))
+    monkeypatch.setattr(H, "build_session", lambda *a, **k: FakeSession())
+    wire.scored_links = {"http://img/T2_0.png"}
+
+    body = json.loads(H.handler({"trip_id": "T2"}, FakeContext(900_000))["body"])
+
+    assert body["status"] == "already_scored"
+    assert wire.autocommit is True           # connection is idle, not idle-in-tx
+    assert wire.committed == 0
+
+
+def test_connect_sets_timeouts_and_read_only_for_the_source(monkeypatch):
+    calls = []
+
+    def _fake_connect(**kw):
+        calls.append(kw)
+        return FakeConn()
+
+    monkeypatch.setattr(H.psycopg2, "connect", _fake_connect)
+    monkeypatch.setattr(H, "LAMBDA_FUNCTION_NAME", "pod-pipeline-stg", raising=False)
+
+    results = H._connect("h", "5432", "sarathy", "u", "p")
+    source = H._connect("h", "5432", "sarathy", "u", "p", read_only=True)
+
+    for kw in calls:
+        assert "statement_timeout" in kw["options"]
+        assert "idle_in_transaction_session_timeout" in kw["options"]
+        assert kw["application_name"] == "pod-pipeline-stg"   # visible in pg_stat_activity
+    assert "default_transaction_read_only=on" not in calls[0]["options"]
+    assert "default_transaction_read_only=on" in calls[1]["options"]
+    assert results.autocommit is True and source.autocommit is True
+
+
+def test_source_connection_is_closed_before_the_slow_work(monkeypatch):
+    """kaptaan must not be held while images download and score."""
+    conn = FakeConn()
+    monkeypatch.setattr(H, "_connect", lambda *a, **k: conn)
+    H.fetch_pod_data("SELECT awb, trip_id, pod FROM kaptaan")
+    assert conn.closed == 1

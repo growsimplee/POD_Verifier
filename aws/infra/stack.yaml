@@ -73,6 +73,28 @@ Parameters:
     Default: "rate(5 minutes)"
     Description: How often to ping the warm pool (Lambda reaps idle containers)
 
+  BackfillSchedule:
+    Type: String
+    Default: "cron(15 0 * * ? *)"
+    Description: >
+      When the whole-dataset backfill sweep runs, read in BackfillTimezone —
+      the default is 00:15 daily. Only fires when BackfillState is ENABLED.
+
+  BackfillTimezone:
+    Type: String
+    Default: Asia/Kolkata
+    Description: >
+      IANA timezone for BackfillSchedule, so the expression reads in local time
+      instead of needing a UTC conversion at the call site.
+
+  BackfillState:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: >
+      Per-trip events are the live trigger, so the sweep ships off. Enable it
+      only for a deliberate backfill — see the note on the schedule below.
+
   LogRetentionDays:
     Type: Number
     Default: 30
@@ -372,18 +394,23 @@ Resources:
         RetryPolicy:
           MaximumRetryAttempts: 0
 
-  # Kept for backfills / manual whole-dataset re-runs, but DISABLED: scoring is
-  # now driven per trip by Sarathy's POD verification request. Re-enable with
-  # `aws scheduler update-schedule --name pod-scoring-daily-<stage> --state ENABLED`
-  # (or flip State below) if a batch sweep is ever needed again.
+  # Whole-dataset sweep, kept for backfills and shipped DISABLED: scoring is
+  # driven per trip by Sarathy's POD verification request.
+  #
+  # Before enabling it, note two things. The batch path's resume checkpoint is
+  # scoped to run_date, while the 30-day link de-dup only guards the single-trip
+  # path — so a nightly sweep re-scores links that per-trip runs already handled
+  # on earlier days. And it competes with live per-trip events for the same
+  # ReservedConcurrency. For a one-off backfill, prefer a date range through
+  # Sarathy's trigger API over turning this on.
   DailySchedule:
     Type: AWS::Scheduler::Schedule
     Properties:
       Name: !Sub pod-scoring-daily-${Stage}
-      Description: Backfill sweep (whole dataset). DISABLED — per-trip events are the live trigger.
-      State: DISABLED
-      ScheduleExpression: cron(25 18 * * ? *)
-      ScheduleExpressionTimezone: UTC
+      Description: !Sub "Backfill sweep (whole dataset) — ${BackfillSchedule} ${BackfillTimezone}"
+      State: !Ref BackfillState
+      ScheduleExpression: !Ref BackfillSchedule
+      ScheduleExpressionTimezone: !Ref BackfillTimezone
       FlexibleTimeWindow:
         Mode: "OFF"
       Target:

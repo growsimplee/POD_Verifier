@@ -79,7 +79,15 @@ else
     --payload "{\"migrate\": \"drop\", \"confirm\": \"${LAMBDA_FUNCTION}\"}" \
     --cli-binary-format raw-in-base64-out /tmp/pod-teardown-drop.json >/dev/null
   cat /tmp/pod-teardown-drop.json; echo
-  if ! grep -q '"status": "dropped"' /tmp/pod-teardown-drop.json; then
+  # The response "body" is a JSON string, so the raw file holds escaped quotes —
+  # parse it instead of grepping for the unescaped form.
+  if ! python3 -c '
+import json, sys
+resp = json.load(open("/tmp/pod-teardown-drop.json"))
+body = resp.get("body")
+body = json.loads(body) if isinstance(body, str) else (body or {})
+sys.exit(0 if body.get("status") == "dropped" else 1)
+'; then
     echo "Drop did not report success. Stopping so the stack stays up and you can retry." >&2
     exit 1
   fi

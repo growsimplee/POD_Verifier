@@ -46,6 +46,7 @@ Design guarantees:
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import json
 import logging
 import os
@@ -142,6 +143,13 @@ MIN_CONTENT_BYTES = int(os.environ.get("MIN_CONTENT_BYTES", "500"))
 # the link itself — new/changed links are always scored. 0 = look back forever.
 RESCORE_LOOKBACK_DAYS = int(os.environ.get("RESCORE_LOOKBACK_DAYS", "30"))
 
+# Guard rails on a shared operational cluster. statement_timeout bounds any one
+# query; idle_in_transaction_session_timeout is the backstop that matters most —
+# a session left inside a transaction pins the database's xmin horizon and stops
+# autovacuum reclaiming dead tuples across every table, not just ours.
+STATEMENT_TIMEOUT_MS = int(os.environ.get("STATEMENT_TIMEOUT_MS", "30000"))
+IDLE_TX_TIMEOUT_MS = int(os.environ.get("IDLE_TX_TIMEOUT_MS", "60000"))
+
 # Warm-pool: how many containers a warmup ping keeps alive (1 = just this one).
 WARM_FANOUT = int(os.environ.get("WARM_FANOUT", "3"))
 
@@ -200,9 +208,56 @@ def get_model() -> tuple[MultiHeadEfficientNet, torch.device]:
 # Postgres helpers
 # --------------------------------------------------------------------------- #
 
-def _connect(host, port, database, user, password):
-    return psycopg2.connect(host=host, port=port, database=database,
-                            user=user, password=password, connect_timeout=10)
+def _connect(host, port, database, user, password, read_only: bool = False):
+    """Connect with autocommit on and server-side timeouts set.
+
+    autocommit matters more than it looks. Without it psycopg2 opens a
+    transaction on the first statement and holds it until an explicit commit —
+    so a plain SELECT would keep a transaction open across image downloads and
+    model inference, and on the warm cached connection it would survive between
+    invocations entirely. That session then holds ACCESS SHARE on the tables it
+    touched (blocking DDL, and queueing every query behind a waiting migration)
+    and pins xmin so autovacuum cannot reclaim dead rows anywhere in the
+    database. Writes take an explicit transaction via _transaction() instead.
+    """
+    options = [f"-c statement_timeout={STATEMENT_TIMEOUT_MS}",
+               f"-c idle_in_transaction_session_timeout={IDLE_TX_TIMEOUT_MS}"]
+    if read_only:
+        # Enforced by Postgres rather than by our own SQL validation — the
+        # ad-hoc query path cannot write even if the regex guard is wrong.
+        options.append("-c default_transaction_read_only=on")
+
+    conn = psycopg2.connect(
+        host=host, port=port, database=database, user=user, password=password,
+        connect_timeout=10,
+        application_name=(LAMBDA_FUNCTION_NAME or "pod-scorer")[:63],
+        options=" ".join(options),
+    )
+    conn.autocommit = True
+    return conn
+
+
+@contextlib.contextmanager
+def _transaction(conn):
+    """Run a write inside one explicit transaction, then leave no session open.
+
+    Connections are autocommit; this brackets the few statements that must be
+    all-or-nothing and always restores autocommit, so nothing is left idle in a
+    transaction on the way out — including on the exception path.
+    """
+    previous = conn.autocommit
+    conn.autocommit = False
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001 — connection already gone
+            pass
+        raise
+    finally:
+        conn.autocommit = previous
 
 
 def get_db_connection():
@@ -244,8 +299,11 @@ def fetch_pod_data(query: Optional[str] = None,
                    params: Optional[dict] = None) -> pd.DataFrame:
     """Run a POD-source query against the source Postgres DB and return the rows."""
     sql = query if query is not None else SOURCE_QUERY
+    # Short-lived and read-only: opened, drained, closed. The slow work
+    # (downloads, inference) happens long after this connection is gone, so the
+    # source table is never held across it.
     conn = _connect(SOURCE_PG_HOST, SOURCE_PG_PORT, SOURCE_PG_DATABASE,
-                    SOURCE_PG_USER, SOURCE_PG_PASSWORD)
+                    SOURCE_PG_USER, SOURCE_PG_PASSWORD, read_only=True)
     try:
         with conn.cursor() as cur:
             cur.execute(sql, params) if params is not None else cur.execute(sql)
@@ -422,9 +480,12 @@ def upsert_results(conn, rows: list[dict], run_date: str) -> int:
                r.get("context_valid_prob"), r.get("package_visible_prob"),
                r.get("label_readable_prob"), r.get("image_clarity_prob"))
               for r in rows]
-    with conn.cursor() as cur:
-        psycopg2.extras.execute_values(cur, sql, tuples, page_size=200)
-    conn.commit()
+    # One transaction for the whole batch: execute_values splits into several
+    # INSERT statements once past page_size, and a partial write would leave the
+    # run half-recorded.
+    with _transaction(conn) as tx:
+        with tx.cursor() as cur:
+            psycopg2.extras.execute_values(cur, sql, tuples, page_size=200)
     return len(tuples)
 
 
@@ -619,12 +680,11 @@ def handle_migrate(event: dict) -> dict:
 
     conn = get_db_connection()
     try:
-        with conn.cursor() as cur:
-            for stmt in statements:
-                cur.execute(stmt)
-        conn.commit()
-    except Exception as e:  # noqa: BLE001
-        conn.rollback()
+        with _transaction(conn) as tx:
+            with tx.cursor() as cur:
+                for stmt in statements:
+                    cur.execute(stmt)
+    except Exception as e:  # noqa: BLE001 — _transaction already rolled back
         logger.error("Migrate failed: %s", e)
         return {"statusCode": 500, "body": json.dumps({"error": str(e), "status": "failed"})}
     finally:

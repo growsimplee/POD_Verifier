@@ -63,6 +63,37 @@ build-and-push; this pipeline also needs CloudFormation, IAM, Logs, SNS,
 CloudWatch, SQS, EC2 and Scheduler. An `AccessDenied` in `release` means the
 policy needs widening.
 
+## IAM for the CI user
+
+The org's CircleCI keys were provisioned for build-and-push. This pipeline also
+creates a CloudFormation stack, so the deploying principal needs more.
+[`infra/ci-policy.json`](infra/ci-policy.json) is that policy — scoped to
+`pod-*` resources rather than granted account-wide, and reusable in both
+accounts since every ARN wildcards the account and region.
+
+```bash
+aws iam create-policy \
+  --policy-name PodVerifierDeploy \
+  --policy-document file://infra/ci-policy.json
+
+aws iam attach-user-policy \
+  --user-name circleCi \
+  --policy-arn arn:aws:iam::<account>:policy/PodVerifierDeploy
+```
+
+CloudFormation creates the stack's resources as the calling principal (there is
+no service role on the stack), which is why the user needs Lambda, IAM, Logs,
+SNS, SQS, CloudWatch, EC2 and Scheduler permissions and not just
+`cloudformation:*`. The `iam:*` grants are restricted to the two roles the stack
+owns — `pod-pipeline-fn-*` and `pod-pipeline-scheduler-*` — and `iam:PassRole`
+additionally requires the target service to be Lambda or Scheduler, so these
+keys cannot mint a role for anything else.
+
+Longer term this is better done with a CloudFormation **service role**: the CI
+user gets `cloudformation:*` on these stacks plus `iam:PassRole` on one role,
+and that role holds the resource permissions. Better still, replace the
+long-lived user keys with OIDC.
+
 ## Prerequisites for running the scripts by hand
 
 - Docker (with buildx) running.

@@ -311,9 +311,7 @@ jobs:
               --function-name "${LAMBDA_FUNCTION}" --region "${AWS_REGION}" \
               --payload '{"migrate": true}' --cli-binary-format raw-in-base64-out \
               /tmp/migrate.json >/dev/null
-            cat /tmp/migrate.json; echo
-            grep -q '"status": "applied"' /tmp/migrate.json \
-              || { echo "Schema migration did not report applied — see the payload above."; exit 1; }
+            python3 aws/ci/check_lambda_response.py /tmp/migrate.json applied
 
       - run:
           name: Smoke test — warm the function and verify the live image
@@ -322,9 +320,7 @@ jobs:
               --function-name "${LAMBDA_FUNCTION}" --region "${AWS_REGION}" \
               --payload '{"warmup": true, "fanout": 1}' --cli-binary-format raw-in-base64-out \
               /tmp/warm.json >/dev/null
-            cat /tmp/warm.json; echo
-            grep -q '"status": "warm"' /tmp/warm.json \
-              || { echo "Warm ping failed — the container did not come up."; exit 1; }
+            python3 aws/ci/check_lambda_response.py /tmp/warm.json warm
             # The image URI lives on get-function (Code.ImageUri), NOT on
             # get-function-configuration — that API has no ImageUri field.
             LIVE="$(aws lambda get-function \
