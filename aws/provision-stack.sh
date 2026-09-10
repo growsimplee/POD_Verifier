@@ -12,7 +12,7 @@
 #   # all three queries have defaults; override only to change what is scored:
 #   export SOURCE_QUERY="SELECT awb, trip_id, pod FROM kaptaan WHERE tour_date = CURRENT_DATE"
 #   # optional, has a sane default; MUST keep the %(trip_id)s placeholder:
-#   export TRIP_QUERY="SELECT awb, trip_id, pod FROM kaptaan WHERE trip_id = %(trip_id)s"
+#   export TRIP_QUERY="SELECT COALESCE(trip_name, 'TRIP-' || trip_id) AS awb, trip_id, pod FROM trip WHERE trip_id = %(trip_id)s"
 #   # optional: IAM principal (Sarathy) allowed to invoke the function
 #   export INVOKER_PRINCIPAL_ARNS=arn:aws:iam::123456789012:role/sarathy-task-role
 #   export PG_HOST=db.xxx.rds.amazonaws.com
@@ -39,7 +39,7 @@ STAGE="${STAGE:-stg}"
 VPC_ID="${VPC_ID:-}"
 SUBNET_IDS="${SUBNET_IDS:-}"
 SOURCE_QUERY="${SOURCE_QUERY:-SELECT awb, trip_id, pod FROM kaptaan WHERE tour_date = CURRENT_DATE}"
-TRIP_QUERY="${TRIP_QUERY:-SELECT awb, trip_id, pod FROM kaptaan WHERE trip_id = %(trip_id)s}"
+TRIP_QUERY="${TRIP_QUERY:-SELECT COALESCE(trip_name, 'TRIP-' || trip_id) AS awb, trip_id, pod FROM trip WHERE trip_id = %(trip_id)s}"
 RANGE_QUERY="${RANGE_QUERY:-SELECT awb, trip_id, pod FROM kaptaan WHERE tour_date BETWEEN %(start_date)s AND %(end_date)s}"
 ALLOW_ADHOC_QUERY="${ALLOW_ADHOC_QUERY:-true}"
 RESCORE_LOOKBACK_DAYS="${RESCORE_LOOKBACK_DAYS:-30}"

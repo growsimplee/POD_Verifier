@@ -353,6 +353,7 @@ def test_empty_event_still_routes_to_batch(wire, monkeypatch):
 
 
 def test_single_trip_scores_only_that_trip(wire, monkeypatch):
+    """No links in the event — e.g. a console invoke — so the fallback resolves them."""
     monkeypatch.setattr(H, "fetch_trip_pod_data", lambda tid: _trip_df("T99", 3))
     monkeypatch.setattr(H, "build_session", lambda *a, **k: FakeSession())
 
@@ -368,6 +369,33 @@ def test_single_trip_scores_only_that_trip(wire, monkeypatch):
     # every upserted row is bound to the triggering trip — no other trip touched
     assert {r["trip_id"] for r in wire.upserted} == {"T99"}
     assert len(wire.upserted) == 3
+
+
+def test_event_links_win_over_the_derived_table(wire, monkeypatch):
+    """kaptaan lags the trip table, so a stale link must not beat a fresh one.
+
+    Only reproducible on prod, where the derived pipeline actually runs: the
+    rider replaces a photo, re-raises the request, and the old link is still
+    what kaptaan holds.
+    """
+    called = {"n": 0}
+
+    def _stale(tid):
+        called["n"] += 1
+        return pd.DataFrame([
+            {"awb": "A1", "trip_id": tid, "pod": "http://img/stale.png"},
+        ])
+
+    monkeypatch.setattr(H, "fetch_trip_pod_data", _stale)
+    monkeypatch.setattr(H, "build_session", lambda *a, **k: FakeSession())
+
+    body = json.loads(H.handler({
+        "trip_id": 90, "pod_links": ["http://img/fresh.png"],
+    }, FakeContext(900_000))["body"])
+
+    assert body["source"] == "event_payload"
+    assert [r["pod_link"] for r in wire.upserted] == ["http://img/fresh.png"]
+    assert called["n"] == 0, "the derived table should not even be consulted"
 
 
 def test_single_trip_falls_back_to_event_links(wire, monkeypatch):

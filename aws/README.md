@@ -18,7 +18,7 @@ applied with [`provision-stack.sh`](provision-stack.sh); image delivery is
 
 | Event | Mode | Behaviour |
 |---|---|---|
-| `{"trip_id": 12345, "pod_links": [...]}` | **single trip** (live path) | Resolves that trip's PODs via `TRIP_QUERY` (parameterised on `trip_id`), falling back to the `pod_links` carried in the event. Scores + upserts in one pass — no windowing, no continuation. Links this trip has already scored are skipped. |
+| `{"trip_id": 12345, "pod_links": [...]}` | **single trip** (live path) | Scores the `pod_links` carried in the event, falling back to `TRIP_QUERY` (parameterised on `trip_id`) when it carries none. Scores + upserts in one pass — no windowing, no continuation. Links this trip has already scored are skipped. |
 | `{"start_date": "…", "end_date": "…"}` | **batch, date range** | `RANGE_QUERY` with both dates bound as parameters. |
 | `{"query": "SELECT …"}` | **batch, ad-hoc SQL** | Validated as a single read-only `SELECT`/`WITH`, then run as-is. |
 | `{}` | **batch, default** | The original whole-dataset run over `SOURCE_QUERY`, unchanged. |
@@ -33,10 +33,15 @@ carrying the same JSON routes to the single-trip path too.
 {"trip_id": 12345, "pod_links": ["https://.../a.jpg"], "awb": "ABC123"}
 ```
 
-`pod_links` and `awb` are optional. `TRIP_QUERY` wins when it returns rows (it
-carries the real AWB); the event payload is the fallback for the common case where
-Sarathy fires the instant the request is raised, before the source row exists. With
-no AWB from either side, rows are keyed `TRIP-<trip_id>`.
+`pod_links` and `awb` are optional, but the event **wins when it carries links**.
+`kaptaan` is derived from sarathy's trip table by a pipeline, so it lags: a rider
+who replaces a photo and re-raises the request would otherwise have the previous
+photo scored. `TRIP_QUERY` is the fallback for callers that only know the trip id
+— a console test event, say. With no AWB from either side, rows are keyed
+`TRIP-<trip_id>`.
+
+On staging the derived pipeline is not running at all, so `TRIP_QUERY` never
+returns rows there and the event payload is the only source.
 
 ### Re-requests: only new work
 
@@ -260,6 +265,22 @@ where the source rows move to a different database than the scores.
 In CI the connection comes from the org context's own names, mapped in
 `configure-aws`: `DBHOST`, `DB_PASSWORD`, `DBPORT`, `DB_USERNAME` and
 `SARATHY_DBNAME`. Nothing needs duplicating under `PG_*`.
+
+### Two traps in the source data
+
+**`kaptaan` is derived, and it is not the live view.** A pipeline rebuilds it
+from sarathy's `trip` table, so it lags — and on staging that pipeline does not
+run at all, leaving the table empty. That is why the single-trip path reads
+`trip` directly and only the batch queries use `kaptaan`, where a historical,
+analytics-shaped table is the right thing and a scan of the operational table
+would not be.
+
+**Never filter on `kaptaan.metadata`.** The column is there, but the prod
+pipeline stopped populating it, so `metadata->>'podVerificationStatus'` matches
+nothing. A query using it returns zero rows and looks like "no PODs to score"
+rather than like a broken query — the worst kind of failure. Verification status
+lives on sarathy's `trip.metadata`, written by `sendPodVerificationRequest`;
+select on that instead if a run needs restricting by status.
 
 ## Bootstrapping
 

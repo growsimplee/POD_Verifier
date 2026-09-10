@@ -7,9 +7,10 @@ PRIMARY (event-driven, one trip):
 
         {"trip_id": 12345, "pod_links": ["https://..."], "awb": "..."}   # links optional
 
-    The function resolves that trip's POD images (TRIP_QUERY against Postgres,
-    falling back to the links carried in the event), scores them, and upserts
-    into pod_scores. Small, fast, no windowing/continuation needed.
+    The function scores the links carried in the event — the freshest view of
+    the trip — falling back to TRIP_QUERY against Postgres when the event has
+    none. Results are upserted into pod_scores. Small, fast, no windowing or
+    continuation needed.
 
 SECONDARY (batch, on demand from Sarathy's admin API or a manual invoke):
     An event with no trip_id scores a whole selection of rows, chosen by:
@@ -93,11 +94,17 @@ PG_PASSWORD = os.environ.get("PG_PASSWORD", "")
 # cluster means setting SOURCE_PG_DATABASE alone.
 SOURCE_QUERY = os.environ.get("SOURCE_QUERY", "")
 
-# Single-trip mode: SQL run with a named %(trip_id)s parameter to resolve one
-# trip's POD rows. Same column contract as SOURCE_QUERY.
+# Single-trip fallback: SQL with a named %(trip_id)s parameter, used only when
+# the trigger event carries no links. It reads sarathy's live `trip` table
+# rather than the derived `kaptaan` the batch queries use, for three reasons:
+# `kaptaan` is rebuilt by a pipeline that does not run on staging at all, it
+# lags the trip table wherever it does run, and `trip.trip_name` carries the
+# real AWB. Indexed lookup on the primary key, so the cost to sarathy's
+# operational database is negligible — unlike a batch scan, which stays on
+# `kaptaan`. Same column contract as SOURCE_QUERY.
 TRIP_QUERY = os.environ.get(
     "TRIP_QUERY",
-    "SELECT awb, trip_id, pod FROM kaptaan WHERE trip_id = %(trip_id)s",
+    "SELECT COALESCE(trip_name, 'TRIP-' || trip_id) AS awb, trip_id, pod FROM trip WHERE trip_id = %(trip_id)s",
 )
 
 # Batch/backfill over an explicit date range: bound as named parameters.
@@ -780,6 +787,8 @@ def handle_single_trip(event: dict, context: Any) -> dict:
 
     Re-requests are cheap: links this trip has already scored are skipped, and
     only links that are new or changed since the last request are downloaded.
+
+    Source order is deliberate — see the comment below.
     """
     t_start = time.time()
     trip_id = str(event["trip_id"]).strip()
@@ -789,19 +798,25 @@ def handle_single_trip(event: dict, context: Any) -> dict:
     if not PG_HOST or not PG_PASSWORD:
         return {"statusCode": 500, "body": json.dumps({"error": "Missing Postgres config"})}
 
-    source = "trip_query"
-    rows: list[dict] = []
-    if TRIP_QUERY:
+    # The event carries the trip's POD links as they were at the instant the
+    # rider raised the request. TRIP_QUERY reads `kaptaan`, which a pipeline
+    # derives from that same trip table and therefore lags it. For one trip the
+    # fresher source has to win: a rider who replaced a photo and re-raised the
+    # request would otherwise have the *old* photo scored, and only on prod,
+    # where kaptaan is actually populated.
+    rows = rows_from_event(event, trip_id)
+    source = "event_payload"
+
+    if not rows and TRIP_QUERY:
+        # Nothing in the event — a console invoke carrying only a trip_id, or a
+        # caller that does not know the links. Fall back to the derived table.
         try:
             raw = fetch_trip_pod_data(trip_id)
             if not raw.empty:
                 rows = expand_pod_links(raw).to_dict("records")
-        except Exception as e:  # noqa: BLE001 — fall back to the event payload
-            logger.warning("TRIP_QUERY failed for trip %s: %s", trip_id, e)
-
-    if not rows:
-        rows = rows_from_event(event, trip_id)
-        source = "event_payload"
+                source = "trip_query"
+        except Exception as e:  # noqa: BLE001 — nothing left to try
+            logger.warning("TRIP_QUERY fallback failed for trip %s: %s", trip_id, e)
 
     if not rows:
         logger.warning("No POD links for trip %s (run=%s)", trip_id, run_id)
