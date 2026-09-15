@@ -3,8 +3,10 @@ Description: >
   POD pipeline — VPC Lambda (container image). Primary trigger is event-driven:
   Sarathy invokes it asynchronously with {"trip_id": N} when a rider raises a
   POD verification request, and only that trip's images are scored. The daily
-  EventBridge schedule is kept but DISABLED, for backfills / manual whole-dataset
-  re-runs. No SAM. Deploy with aws/provision-stack.sh.
+  EventBridge schedule is kept but DISABLED, for backfills and manual re-runs.
+  The function holds no database credentials: it reads what to score from, and
+  writes pod_scores back through, sarathy's /internal/pod-scoring API.
+  No SAM. Deploy with aws/provision-stack.sh.
 
 Parameters:
   Stage:
@@ -13,57 +15,38 @@ Parameters:
     AllowedValues: [dev, stg, prod]
 
 
-  # Do NOT filter these on kaptaan.metadata. The column exists but the prod
-  # pipeline stopped populating it, so `metadata->>'podVerificationStatus'`
-  # matches nothing — a batch run would return zero rows and read as "no PODs
-  # today" rather than as a broken query. Verification status lives on
-  # sarathy's own trip.metadata, which is written by sendPodVerificationRequest;
-  # select on that if a run needs to be restricted by status.
-  SourceQuery:
+  # Sarathy owns the pod_scores table and the trip/kaptaan reads. This function
+  # holds no database credentials and no SQL: it asks sarathy's internal POD
+  # scoring API for the rows to score and POSTs the results back. One service,
+  # one writer.
+  SarathyBaseUrl:
     Type: String
-    Default: "SELECT awb, trip_id, pod FROM kaptaan WHERE tour_date = CURRENT_DATE"
     Description: >
-      Backfill/batch only. SQL run against Postgres to read the day's POD rows.
-      Must return an AWB column, a trip-id column, and a POD-links column
-      (POD / pod / pod_link; comma-separated links are expanded). Same shape as
-      TripQuery and RangeQuery, and defaulted here for the same reason — a query
-      is code, so it belongs in review rather than in a CI settings form.
+      Sarathy on the shared internal NLB, reachable from the Lambda's subnets —
+      the same address logistic uses (url.sarathy.base). Sarathy listens on
+      9001 with no context path, so this is scheme, host and port only; the
+      client appends /internal/pod-scoring. It MUST be the INTERNAL NLB: those
+      endpoints carry no app-level token, so a publicly routable address would
+      expose an unauthenticated write to pod_scores.
+      stage: http://grow-simplee-nlb-staging-0dff0c43a1132f00.elb.us-east-2.amazonaws.com:9001
+      prod:  http://grow-simplee-nlb-prod-a264c46571856f67.elb.ap-south-1.amazonaws.com:9001
 
-  TripQuery:
+  SarathyTimeout:
     Type: String
-    Default: "SELECT COALESCE(trip_name, 'TRIP-' || trip_id) AS awb, trip_id, pod FROM trip WHERE trip_id = %(trip_id)s"
-    Description: >
-      Fallback for the single-trip path, used only when the trigger event carries
-      no links. Reads the live `trip` table rather than the derived `kaptaan`
-      the batch queries use — `kaptaan` does not run on staging and lags
-      elsewhere, and `trip.trip_name` is the real AWB. Same column contract as
-      SourceQuery, and MUST keep the named %(trip_id)s placeholder — it is bound
-      as a query parameter, never string-interpolated.
+    Default: "15"
+    Description: Per-request timeout in seconds for calls to sarathy.
 
-  RangeQuery:
+  SarathyRetries:
     Type: String
-    Default: "SELECT awb, trip_id, pod FROM kaptaan WHERE tour_date BETWEEN %(start_date)s AND %(end_date)s"
-    Description: >
-      Backfill by date range, used when the trigger event carries start_date /
-      end_date. MUST keep the named %(start_date)s and %(end_date)s placeholders —
-      they are bound as query parameters, never string-interpolated.
+    Default: "3"
+    Description: Attempts per sarathy call before the run fails.
 
-  AllowAdhocQuery:
+  SarathyPageSize:
     Type: String
-    Default: "true"
-    AllowedValues: ["true", "false"]
+    Default: "500"
     Description: >
-      Allow a trigger event to carry raw SQL. It is validated as a single
-      read-only SELECT/WITH before it reaches Postgres; set false to refuse
-      ad-hoc SQL entirely.
-
-  RescoreLookbackDays:
-    Type: Number
-    Default: 30
-    Description: >
-      A POD link already scored within this many days is not re-downloaded when
-      a rider re-raises a request. Keyed on the link, so replaced photos are
-      always scored. 0 = never re-score a link.
+      Rows requested per page from the batch endpoint. Sarathy caps this at
+      2000; larger values are clamped server-side.
 
   TripMaxDownloadWorkers:
     Type: String
@@ -86,7 +69,7 @@ Parameters:
     Type: String
     Default: "cron(15 0 * * ? *)"
     Description: >
-      When the whole-dataset backfill sweep runs, read in BackfillTimezone —
+      When the daily backfill sweep runs, read in BackfillTimezone —
       the default is 00:15 daily. Only fires when BackfillState is ENABLED.
 
   BackfillTimezone:
@@ -143,52 +126,6 @@ Parameters:
     AllowedValues: ["true", "false"]
     Description: Apply ImageNet mean/std at inference (must match training preprocessing)
 
-  PgHost:
-    Type: String
-    Description: PostgreSQL endpoint (source query + results both run here)
-
-  PgPort:
-    Type: String
-    Default: "5432"
-
-  PgDatabase:
-    Type: String
-    Default: pod_classifier
-
-  PgUser:
-    Type: String
-    Default: postgres
-
-  # Where the POD rows are READ from. Each of these inherits the PgX value above
-  # when left empty. The common case is a sibling database on the same cluster
-  # (POD rows in `kaptaan` in the app database, scores written elsewhere), which
-  # needs SourcePgDatabase alone — Postgres cannot cross databases on a single
-  # connection, so the handler dials a second one.
-  SourcePgHost:
-    Type: String
-    Default: ""
-    Description: Source DB endpoint. Empty = same as PgHost.
-
-  SourcePgDatabase:
-    Type: String
-    Default: ""
-    Description: Source database name (e.g. sarathy). Empty = same as PgDatabase.
-
-  SourcePgUser:
-    Type: String
-    Default: ""
-    Description: Empty = same as PgUser.
-
-  SourcePgPassword:
-    Type: String
-    Default: ""
-    NoEcho: true
-    Description: Empty = same as PgPassword.
-
-  PgPassword:
-    Type: String
-    NoEcho: true
-
   VpcId:
     Type: AWS::EC2::VPC::Id
 
@@ -209,7 +146,7 @@ Parameters:
     Description: >
       Per-trip events arrive whenever riders request verification, so this is
       sized for concurrent trips rather than a single daily run. Also caps load
-      on the source host and the DB. Must exceed WarmPoolSize, since warm pings
+      on the source image host and on sarathy. Must exceed WarmPoolSize, since warm pings
       hold slots too — leave headroom for batch runs and continuations.
 
   InvokerPrincipalArns:
@@ -302,11 +239,10 @@ Resources:
         SubnetIds: !Ref SubnetIds
       Environment:
         Variables:
-          SOURCE_QUERY: !Ref SourceQuery
-          TRIP_QUERY: !Ref TripQuery
-          RANGE_QUERY: !Ref RangeQuery
-          ALLOW_ADHOC_QUERY: !Ref AllowAdhocQuery
-          RESCORE_LOOKBACK_DAYS: !Ref RescoreLookbackDays
+          SARATHY_BASE_URL: !Ref SarathyBaseUrl
+          SARATHY_TIMEOUT: !Ref SarathyTimeout
+          SARATHY_RETRIES: !Ref SarathyRetries
+          SARATHY_PAGE_SIZE: !Ref SarathyPageSize
           TRIP_MAX_DOWNLOAD_WORKERS: !Ref TripMaxDownloadWorkers
           WARM_FANOUT: !Ref WarmPoolSize
           FLAG_THRESHOLD: !Ref FlagThreshold
@@ -316,15 +252,6 @@ Resources:
           IMAGENET_NORMALIZE: !Ref ImagenetNormalize
           CONTINUATION_SAFETY_MS: "90000"
           MAX_CONTINUATIONS: "5"
-          PG_HOST: !Ref PgHost
-          PG_PORT: !Ref PgPort
-          PG_DATABASE: !Ref PgDatabase
-          PG_USER: !Ref PgUser
-          PG_PASSWORD: !Ref PgPassword
-          SOURCE_PG_HOST: !Ref SourcePgHost
-          SOURCE_PG_DATABASE: !Ref SourcePgDatabase
-          SOURCE_PG_USER: !Ref SourcePgUser
-          SOURCE_PG_PASSWORD: !Ref SourcePgPassword
           MODEL_PATH: /opt/model/best.pt
           INPUT_SIZE: "224"
 
@@ -416,7 +343,7 @@ Resources:
     Type: AWS::Scheduler::Schedule
     Properties:
       Name: !Sub pod-scoring-daily-${Stage}
-      Description: !Sub "Backfill sweep (whole dataset) — ${BackfillSchedule} ${BackfillTimezone}"
+      Description: !Sub "Backfill sweep (the day's PODs) — ${BackfillSchedule} ${BackfillTimezone}"
       State: !Ref BackfillState
       ScheduleExpression: !Ref BackfillSchedule
       ScheduleExpressionTimezone: !Ref BackfillTimezone

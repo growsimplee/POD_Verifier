@@ -9,24 +9,19 @@
 #   export STAGE=prod
 #   export VPC_ID=vpc-xxx
 #   export SUBNET_IDS=subnet-a,subnet-b
-#   # all three queries have defaults; override only to change what is scored:
-#   export SOURCE_QUERY="SELECT awb, trip_id, pod FROM kaptaan WHERE tour_date = CURRENT_DATE"
-#   # optional, has a sane default; MUST keep the %(trip_id)s placeholder:
-#   export TRIP_QUERY="SELECT COALESCE(trip_name, 'TRIP-' || trip_id) AS awb, trip_id, pod FROM trip WHERE trip_id = %(trip_id)s"
+#   # sarathy on the internal NLB — this function holds no DB credentials, no SQL
+#   export SARATHY_BASE_URL=http://grow-simplee-nlb-staging-0dff0c43a1132f00.elb.us-east-2.amazonaws.com:9001
 #   # optional: IAM principal (Sarathy) allowed to invoke the function
 #   export INVOKER_PRINCIPAL_ARNS=arn:aws:iam::123456789012:role/sarathy-task-role
-#   export PG_HOST=db.xxx.rds.amazonaws.com
-#   export PG_PASSWORD=secret
 #   export SCORER_IMAGE_URI=123456789012.dkr.ecr.ap-south-1.amazonaws.com/pod-pipeline:latest
 #
-# Optional: TRIP_QUERY RANGE_QUERY ALLOW_ADHOC_QUERY RESCORE_LOOKBACK_DAYS
+# Optional: SARATHY_TIMEOUT SARATHY_RETRIES SARATHY_PAGE_SIZE
 #           TRIP_MAX_DOWNLOAD_WORKERS WARM_POOL_SIZE WARMUP_RATE
 #           LOG_RETENTION_DAYS ALARM_EMAIL
 #           BACKFILL_SCHEDULE BACKFILL_TIMEZONE BACKFILL_STATE
-#           SOURCE_PG_HOST SOURCE_PG_DATABASE SOURCE_PG_USER SOURCE_PG_PASSWORD
 #           INVOKER_PRINCIPAL_ARNS RESERVED_CONCURRENCY FLAG_THRESHOLD
 #           INFERENCE_BATCH_SIZE MAX_DOWNLOAD_WORKERS WINDOW_SIZE IMAGENET_NORMALIZE
-#           PG_PORT PG_DATABASE PG_USER TMP_EPHEMERAL_MB
+#           TMP_EPHEMERAL_MB
 #
 set -euo pipefail
 
@@ -38,11 +33,10 @@ STACK_NAME="${STACK_NAME:-pod-scoring-stg}"
 STAGE="${STAGE:-stg}"
 VPC_ID="${VPC_ID:-}"
 SUBNET_IDS="${SUBNET_IDS:-}"
-SOURCE_QUERY="${SOURCE_QUERY:-SELECT awb, trip_id, pod FROM kaptaan WHERE tour_date = CURRENT_DATE}"
-TRIP_QUERY="${TRIP_QUERY:-SELECT COALESCE(trip_name, 'TRIP-' || trip_id) AS awb, trip_id, pod FROM trip WHERE trip_id = %(trip_id)s}"
-RANGE_QUERY="${RANGE_QUERY:-SELECT awb, trip_id, pod FROM kaptaan WHERE tour_date BETWEEN %(start_date)s AND %(end_date)s}"
-ALLOW_ADHOC_QUERY="${ALLOW_ADHOC_QUERY:-true}"
-RESCORE_LOOKBACK_DAYS="${RESCORE_LOOKBACK_DAYS:-30}"
+SARATHY_BASE_URL="${SARATHY_BASE_URL:-}"
+SARATHY_TIMEOUT="${SARATHY_TIMEOUT:-15}"
+SARATHY_RETRIES="${SARATHY_RETRIES:-3}"
+SARATHY_PAGE_SIZE="${SARATHY_PAGE_SIZE:-500}"
 TRIP_MAX_DOWNLOAD_WORKERS="${TRIP_MAX_DOWNLOAD_WORKERS:-8}"
 WARM_POOL_SIZE="${WARM_POOL_SIZE:-3}"
 WARMUP_RATE="${WARMUP_RATE:-rate(5 minutes)}"
@@ -58,15 +52,6 @@ INFERENCE_BATCH_SIZE="${INFERENCE_BATCH_SIZE:-64}"
 MAX_DOWNLOAD_WORKERS="${MAX_DOWNLOAD_WORKERS:-64}"
 WINDOW_SIZE="${WINDOW_SIZE:-800}"
 IMAGENET_NORMALIZE="${IMAGENET_NORMALIZE:-true}"
-PG_HOST="${PG_HOST:-}"
-PG_PASSWORD="${PG_PASSWORD:-}"
-PG_PORT="${PG_PORT:-5432}"
-PG_DATABASE="${PG_DATABASE:-pod_classifier}"
-PG_USER="${PG_USER:-postgres}"
-SOURCE_PG_HOST="${SOURCE_PG_HOST:-}"
-SOURCE_PG_DATABASE="${SOURCE_PG_DATABASE:-}"
-SOURCE_PG_USER="${SOURCE_PG_USER:-}"
-SOURCE_PG_PASSWORD="${SOURCE_PG_PASSWORD:-}"
 TMP_EPHEMERAL_MB="${TMP_EPHEMERAL_MB:-512}"   # in-memory design uses no /tmp
 SCORER_IMAGE_URI="${SCORER_IMAGE_URI:-}"
 
@@ -74,20 +59,26 @@ if [[ -z "$VPC_ID" || -z "$SUBNET_IDS" ]]; then
   echo "Set VPC_ID and SUBNET_IDS (comma-separated private subnets)." >&2
   exit 1
 fi
-if [[ "$TRIP_QUERY" != *"%(trip_id)s"* ]]; then
-  echo "TRIP_QUERY must contain the named placeholder %(trip_id)s." >&2
+if [[ -z "$SARATHY_BASE_URL" ]]; then
+  echo "Set SARATHY_BASE_URL (sarathy's internal API base, reachable from SUBNET_IDS)." >&2
   exit 1
 fi
-if [[ "$RANGE_QUERY" != *"%(start_date)s"* || "$RANGE_QUERY" != *"%(end_date)s"* ]]; then
-  echo "RANGE_QUERY must contain the placeholders %(start_date)s and %(end_date)s." >&2
-  exit 1
+# /internal/pod-scoring has no app-level auth, so the host must be one that only
+# resolves inside the VPC. Resolve it and check: a public answer means the write
+# endpoint would be reachable from the internet.
+if command -v getent >/dev/null 2>&1; then
+  SARATHY_HOST="${SARATHY_BASE_URL#*://}"; SARATHY_HOST="${SARATHY_HOST%%[:/]*}"
+  SARATHY_IPS="$(getent ahostsv4 "$SARATHY_HOST" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')"
+  case "${SARATHY_IPS:-none}" in
+    none) echo "NOTE: could not resolve ${SARATHY_HOST} from here — verify it is the INTERNAL endpoint." >&2 ;;
+    10.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|192.168.*) : ;;
+    *) echo "REFUSING: ${SARATHY_HOST} resolves to ${SARATHY_IPS}— that is not a private address." >&2
+       echo "          /internal/pod-scoring has no auth; point this at the internal NLB." >&2
+       exit 1 ;;
+  esac
 fi
 if (( WARM_POOL_SIZE >= RESERVED_CONCURRENCY )); then
   echo "WARM_POOL_SIZE ($WARM_POOL_SIZE) must be below RESERVED_CONCURRENCY ($RESERVED_CONCURRENCY)." >&2
-  exit 1
-fi
-if [[ -z "$PG_HOST" || -z "$PG_PASSWORD" ]]; then
-  echo "Set PG_HOST and PG_PASSWORD." >&2
   exit 1
 fi
 if [[ -z "$SCORER_IMAGE_URI" ]]; then
@@ -97,11 +88,10 @@ fi
 
 OVERRIDES=(
   "Stage=${STAGE}"
-  "SourceQuery=${SOURCE_QUERY}"
-  "TripQuery=${TRIP_QUERY}"
-  "RangeQuery=${RANGE_QUERY}"
-  "AllowAdhocQuery=${ALLOW_ADHOC_QUERY}"
-  "RescoreLookbackDays=${RESCORE_LOOKBACK_DAYS}"
+  "SarathyBaseUrl=${SARATHY_BASE_URL}"
+  "SarathyTimeout=${SARATHY_TIMEOUT}"
+  "SarathyRetries=${SARATHY_RETRIES}"
+  "SarathyPageSize=${SARATHY_PAGE_SIZE}"
   "TripMaxDownloadWorkers=${TRIP_MAX_DOWNLOAD_WORKERS}"
   "WarmPoolSize=${WARM_POOL_SIZE}"
   "WarmupRate=${WARMUP_RATE}"
@@ -117,15 +107,6 @@ OVERRIDES=(
   "MaxDownloadWorkers=${MAX_DOWNLOAD_WORKERS}"
   "WindowSize=${WINDOW_SIZE}"
   "ImagenetNormalize=${IMAGENET_NORMALIZE}"
-  "PgHost=${PG_HOST}"
-  "PgPassword=${PG_PASSWORD}"
-  "PgPort=${PG_PORT}"
-  "PgDatabase=${PG_DATABASE}"
-  "PgUser=${PG_USER}"
-  "SourcePgHost=${SOURCE_PG_HOST}"
-  "SourcePgDatabase=${SOURCE_PG_DATABASE}"
-  "SourcePgUser=${SOURCE_PG_USER}"
-  "SourcePgPassword=${SOURCE_PG_PASSWORD}"
   "VpcId=${VPC_ID}"
   "SubnetIds=${SUBNET_IDS}"
   "ScorerImageUri=${SCORER_IMAGE_URI}"

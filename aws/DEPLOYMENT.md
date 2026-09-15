@@ -17,6 +17,12 @@ Infra is plain **CloudFormation** + Docker + AWS CLI — **no SAM, no CDK**.
 - **Scripts**: `deploy.sh` (ECR repo + build + push), `provision-stack.sh`
   (`aws cloudformation deploy`), `teardown.sh` (destroy an environment).
 
+The function holds **no database credentials**. `pod_scores` is sarathy's table,
+created by sarathy's Flyway migration `V198__pod_scores.sql`; the scorer reads
+what to score from, and writes results back through, sarathy's
+`/internal/pod-scoring` API. Nothing in this repo needs to reach Postgres, which
+is also why CircleCI does not.
+
 ## The normal path: merge and walk away
 
 ```
@@ -27,16 +33,14 @@ any other  →  build + test only, no AWS writes
 
 `release` is idempotent and safe against a completely empty account. It creates
 the ECR repository if it is missing, pushes this commit's image, creates or
-updates the CloudFormation stack pointed at that exact tag, applies the database
-schema, and smoke-tests the result. There is no manual "create the repo" or "run
-schema.sql" step.
+updates the CloudFormation stack pointed at that exact tag, and smoke-tests the
+result. There is no manual "create the repo" step.
 
-The schema is applied by invoking the function with `{"migrate": true}` rather
-than by connecting to Postgres from CI. The database sits in a private subnet
-CircleCI cannot reach; the Lambda is already inside the VPC, so it is the one
-thing that can. `schema.sql` is baked into the image at `/opt/schema/schema.sql`
-(staged from `infra/schema.sql` by `deploy.sh` — edit `infra/schema.sql`, never
-the staged copy).
+There is no schema step either. `pod_scores` arrives with **sarathy's** deploy,
+through Flyway migration `V198__pod_scores.sql`. Deploy sarathy first on a fresh
+environment: without the table the scorer's writes come back `500` from
+`POST /internal/pod-scoring/scores`, which is a clear failure rather than a
+silent one.
 
 ### What CI still cannot invent
 
@@ -46,16 +50,17 @@ fails on the first job naming every one that is missing:
 | Variable | What it is |
 |---|---|
 | `VPC_ID` | The VPC the function runs in |
-| `SUBNET_IDS` | Comma-separated private subnets, with NAT egress and a route to the RDS |
+| `SUBNET_IDS` | Comma-separated private subnets, with NAT egress and a route to sarathy |
+| `SARATHY_BASE_URL` | Sarathy on the internal NLB, port 9001 — the same address logistic uses. Stage: `http://grow-simplee-nlb-staging-0dff0c43a1132f00.elb.us-east-2.amazonaws.com:9001`; prod: `http://grow-simplee-nlb-prod-a264c46571856f67.elb.ap-south-1.amazonaws.com:9001` |
 
-The database needs nothing added: `DBHOST`, `DB_PASSWORD`, `DBPORT`,
-`DB_USERNAME` and `SARATHY_DBNAME` are already in the org contexts and are
-mapped onto `PG_*` automatically. `pod_scores` is created in the sarathy
-database, beside the `kaptaan` table it reads.
+`SARATHY_BASE_URL` must resolve and route from `SUBNET_IDS`, and **must not be
+publicly reachable**: `/internal/pod-scoring` is protected by network isolation
+alone and carries no app-level token, so a public address would expose an
+unauthenticated write to `pod_scores`.
 
-The three queries need nothing added either — `SOURCE_QUERY`, `TRIP_QUERY` and
-`RANGE_QUERY` all default to `kaptaan` in `infra/stack.yaml`. Override one in a
-context only when an environment should score something different.
+There are no database variables. The org contexts' `DBHOST`, `DB_PASSWORD` and
+`SARATHY_DBNAME` are not read by this pipeline and do not need to be — that was
+the point of the change.
 
 Credentials come from the org contexts (`Aws-stage`, `Aws-prod`), which name
 them `ACCESS_KEY_ID` / `AWS_ACCESS_KEY`. Those keys were created for sarathy's
@@ -99,7 +104,8 @@ long-lived user keys with OIDC.
 - Docker (with buildx) running.
 - AWS CLI v2 authenticated with ECR/Lambda/CFN/IAM permissions.
 - `lambda_scorer/model/best.pt` present (baked into the image).
-- Subnets with egress to the RDS endpoint and the POD image host (NAT or VPC endpoints).
+- Subnets with egress to sarathy's internal endpoint and the POD image host (NAT or VPC endpoints).
+- Sarathy already deployed in that environment, with `V198__pod_scores.sql` applied.
 
 ## Doing it manually
 
@@ -111,7 +117,7 @@ cd aws && chmod +x deploy.sh provision-stack.sh teardown.sh
 export AWS_REGION=ap-south-1 STAGE=prod STACK_NAME=pod-scoring-prod
 export ECR_REPOSITORY=pod-pipeline IMAGE_TAG=$(git rev-parse --short=12 HEAD)
 export VPC_ID=vpc-xxx SUBNET_IDS=subnet-a,subnet-b
-export PG_HOST=<db>.rds.amazonaws.com PG_PASSWORD=***
+export SARATHY_BASE_URL=http://grow-simplee-nlb-prod-a264c46571856f67.elb.ap-south-1.amazonaws.com:9001
 export INVOKER_PRINCIPAL_ARNS=arn:aws:iam::<acct>:role/<sarathy-prod-role>
 
 SKIP_LAMBDA_UPDATE=true ./deploy.sh          # creates the ECR repo, pushes
@@ -121,26 +127,26 @@ export SCORER_IMAGE_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR
 ./provision-stack.sh                          # creates the stack + function
 
 aws lambda invoke --function-name pod-pipeline-prod --region "$AWS_REGION" \
-  --payload '{"migrate": true}' --cli-binary-format raw-in-base64-out /dev/stdout
+  --payload '{"warmup": true, "fanout": 1}' --cli-binary-format raw-in-base64-out /dev/stdout
 ```
 
 ## Tearing an environment down
 
-`teardown.sh` reverses all of it, including **dropping `pod_scores` and
-`pod_scores_flagged`** — every score computed so far. It drops the table first,
-while the function that can reach the database still exists, then deletes the
+`teardown.sh` deletes this environment's AWS resources: the CloudFormation
 stack, the ECR repository and any orphaned log group.
 
 ```bash
 cd aws
 AWS_REGION=us-east-2 STAGE=stg STACK_NAME=pod-scoring-stg ./teardown.sh
-#   KEEP_DATABASE=true   leave pod_scores alone
 #   KEEP_ECR=true        keep the repository and its images
 ```
 
-It asks you to type the stack name before doing anything. The VPC, the RDS
-instance, `kaptaan` and the CircleCI contexts are left alone —
-they belong to the platform, not to this service.
+It asks you to type the stack name before doing anything. **`pod_scores` is left
+intact** — it is sarathy's table, created by sarathy's migration, and dropping it
+from here would leave sarathy's migration history claiming it exists. If the
+scored data really has to go, do it from sarathy with a forward migration. The
+VPC, the RDS instance and the CircleCI contexts are left alone too — they belong
+to the platform, not to this service.
 
 ## Routine updates
 
@@ -159,8 +165,9 @@ cd aws && ./deploy.sh
 aws lambda invoke --function-name pod-pipeline-prod \
   --payload '{}' --cli-binary-format raw-in-base64-out /dev/stdout
 
-# Rows land in Postgres
-psql ... -c "SELECT status, count(*) FROM pod_scores WHERE run_date=CURRENT_DATE GROUP BY status;"
+# Rows land in sarathy's pod_scores (query from sarathy or Metabase — this
+# service has no database access of its own)
+#   SELECT status, count(*) FROM pod_scores WHERE run_date = CURRENT_DATE GROUP BY status;
 
 # Coverage metrics (CloudWatch namespace 'PODPipeline'): ImagesScored/Failed/Uncovered
 ```

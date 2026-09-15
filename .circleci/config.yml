@@ -12,14 +12,13 @@
 #   3. cloudformation  — creates or updates the stack, pointed at this commit's
 #                        image tag, so CFN is the only thing that sets the
 #                        function's image (no separate update-function-code race)
-#   4. migrate         — invokes {"migrate": true}; the function is inside the
-#                        VPC, so this is how the schema reaches a private RDS
-#                        that CircleCI itself cannot dial
-#   5. smoke           — a warm ping, then verifies the live image tag
+#   4. smoke           — a warm ping, then verifies the live image tag
 #
-# There is no manual "create the ECR repo" or "run schema.sql" step any more.
-# What CI still cannot invent is the platform it sits on: the VPC, the subnets
-# and the database. Those come from the context and preflight names them.
+# There is no manual "create the ECR repo" step any more, and no schema step at
+# all: pod_scores belongs to sarathy and is created by sarathy's Flyway
+# migration V198. What CI cannot invent is the platform it sits on: the VPC,
+# the subnets and sarathy's internal endpoint. Those come from the context and
+# preflight names them.
 #
 # ---------------------------------------------------------------------------
 # CircleCI contexts — the growsimplee org's existing ones, same as sarathy uses:
@@ -40,28 +39,23 @@
 #
 # Each context must ALSO provide these, which are specific to this service and
 # will not already be there:
-#   VPC_ID        vpc-…
-#   SUBNET_IDS    subnet-a,subnet-b  (NAT egress + a route to the RDS)
+#   VPC_ID            vpc-…
+#   SUBNET_IDS        subnet-a,subnet-b  (NAT egress + a route to sarathy)
+#   SARATHY_BASE_URL  sarathy on the INTERNAL NLB, port 9001 — the same
+#                     address logistic uses as url.sarathy.base
 #
-# The three queries (SOURCE_QUERY, TRIP_QUERY, RANGE_QUERY) are NOT context
-# variables: they default to kaptaan in infra/stack.yaml. Override one in a
-# context only to make an environment score something different.
+# No database variables. This pipeline holds no DB credentials and issues no
+# SQL: the function reads the rows to score from, and writes pod_scores back
+# through, sarathy's /internal/pod-scoring API. Sarathy owns that schema and
+# creates it with Flyway migration V198 — one service, one writer.
 #
-# The database is NOT one of them: configure-aws maps the org's existing
-# variables onto the ones the scripts expect —
-#
-#   DBHOST         -> PG_HOST        DBPORT      -> PG_PORT
-#   DB_PASSWORD    -> PG_PASSWORD    DB_USERNAME -> PG_USER
-#   SARATHY_DBNAME -> PG_DATABASE
-#
-# pod_scores is created in the sarathy database, beside the kaptaan table it
-# reads from, so a single connection serves both and SOURCE_PG_* stays unset.
-# Setting any PG_* explicitly overrides the mapping; set SOURCE_PG_DATABASE
-# only if the POD rows ever move to a different database than the scores.
+# SARATHY_BASE_URL must resolve and route from SUBNET_IDS, and must NOT be
+# publicly reachable: /internal/pod-scoring is protected by network isolation
+# alone and carries no app-level token.
 #
 # Optional, per context:
-#   SOURCE_QUERY TRIP_QUERY RANGE_QUERY ALLOW_ADHOC_QUERY RESCORE_LOOKBACK_DAYS
-#   PG_PORT PG_DATABASE PG_USER FLAG_THRESHOLD INFERENCE_BATCH_SIZE
+#   SARATHY_TIMEOUT SARATHY_RETRIES SARATHY_PAGE_SIZE
+#   FLAG_THRESHOLD INFERENCE_BATCH_SIZE
 #   MAX_DOWNLOAD_WORKERS TRIP_MAX_DOWNLOAD_WORKERS WINDOW_SIZE IMAGENET_NORMALIZE
 #   WARM_POOL_SIZE WARMUP_RATE RESERVED_CONCURRENCY TMP_EPHEMERAL_MB
 #   LOG_RETENTION_DAYS ALARM_EMAIL INVOKER_PRINCIPAL_ARNS
@@ -156,20 +150,6 @@ commands:
               echo "export AWS_ACCESS_KEY_ID=\"${KEY_ID}\""
               echo "export AWS_SECRET_ACCESS_KEY=\"${SECRET}\""
             } >> "$BASH_ENV"
-            # The org already carries the database on its own names — one
-            # DBHOST cluster with a database per service (SARATHY_DBNAME,
-            # LOGISTIC_DBNAME, …). Reuse them rather than duplicating the
-            # credentials under PG_*; an explicit PG_* still wins if set.
-            {
-              [ -n "${PG_HOST:-}" ]     || [ -z "${DBHOST:-}" ]      || echo "export PG_HOST=\"${DBHOST}\""
-              [ -n "${PG_PASSWORD:-}" ] || [ -z "${DB_PASSWORD:-}" ] || echo "export PG_PASSWORD=\"${DB_PASSWORD}\""
-              [ -n "${PG_PORT:-}" ]     || [ -z "${DBPORT:-}" ]      || echo "export PG_PORT=\"${DBPORT}\""
-              [ -n "${PG_USER:-}" ]     || [ -z "${DB_USERNAME:-}" ] || echo "export PG_USER=\"${DB_USERNAME}\""
-              # pod_scores lives in the sarathy database, alongside kaptaan which
-              # it reads. Same database for both, so one connection does it and
-              # SOURCE_PG_* stays unset.
-              [ -n "${PG_DATABASE:-}" ] || [ -z "${SARATHY_DBNAME:-}" ] || echo "export PG_DATABASE=\"${SARATHY_DBNAME}\""
-            } >> "$BASH_ENV"
 
             command -v aws >/dev/null 2>&1 || {
               echo "Installing AWS CLI v2"
@@ -187,7 +167,7 @@ commands:
           name: Check required context variables
           command: |
             missing=""
-            for v in VPC_ID SUBNET_IDS PG_HOST PG_PASSWORD; do
+            for v in VPC_ID SUBNET_IDS SARATHY_BASE_URL; do
               [ -n "${!v:-}" ] || missing="${missing} ${v}"
             done
             if [ -n "${missing}" ]; then
@@ -196,7 +176,11 @@ commands:
               exit 1
             fi
             echo "Context complete for ${STAGE} in ${AWS_REGION}."
-            echo "Database: ${PG_HOST} / ${PG_DATABASE:-pod_classifier} as ${PG_USER:-postgres}"
+            echo "Sarathy API: ${SARATHY_BASE_URL} (no direct DB access)"
+            case "${SARATHY_BASE_URL}" in
+              http://*|https://*) : ;;
+              *) echo "SARATHY_BASE_URL must start with http:// or https://"; exit 1 ;;
+            esac
             echo "Deploying as: $(aws sts get-caller-identity --query Arn --output text)"
             case "${SUBNET_IDS}" in
               *,*) : ;;
@@ -234,11 +218,11 @@ jobs:
             chmod +x deploy.sh provision-stack.sh teardown.sh
             DRY_RUN=true ./deploy.sh
       - run:
-          name: The schema must be baked in — the migrate event reads it at runtime
+          name: The image must carry no database driver
           command: |
             docker run --rm --entrypoint /bin/bash \
               "pod-pipeline-local:${IMAGE_TAG}" -c \
-              "test -s /opt/schema/schema.sql && head -3 /opt/schema/schema.sql"
+              "! python -c 'import psycopg2' 2>/dev/null && python -c 'import sarathy_client; print(\"sarathy_client ok\")'"
       - run:
           name: pytest inside the built image
           command: |
@@ -303,19 +287,10 @@ jobs:
             ./provision-stack.sh
 
       - run:
-          name: Apply the database schema from inside the VPC
+          name: Smoke test — warm the function and verify the live image
           command: |
             aws lambda wait function-updated \
               --function-name "${LAMBDA_FUNCTION}" --region "${AWS_REGION}"
-            aws lambda invoke \
-              --function-name "${LAMBDA_FUNCTION}" --region "${AWS_REGION}" \
-              --payload '{"migrate": true}' --cli-binary-format raw-in-base64-out \
-              /tmp/migrate.json >/dev/null
-            python3 aws/ci/check_lambda_response.py /tmp/migrate.json applied
-
-      - run:
-          name: Smoke test — warm the function and verify the live image
-          command: |
             aws lambda invoke \
               --function-name "${LAMBDA_FUNCTION}" --region "${AWS_REGION}" \
               --payload '{"warmup": true, "fanout": 1}' --cli-binary-format raw-in-base64-out \

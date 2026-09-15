@@ -19,15 +19,11 @@ RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
 COPY src/ ${LAMBDA_TASK_ROOT}/src/
 COPY model/best.pt /opt/model/best.pt
 COPY handler.py ${LAMBDA_TASK_ROOT}/
-
-# Schema for the {"migrate": true} bootstrap event. deploy.sh stages this from
-# infra/schema.sql into the build context, so infra/schema.sql stays the single
-# source of truth and the file here is generated, never edited.
-COPY schema.sql /opt/schema/schema.sql
+COPY sarathy_client.py ${LAMBDA_TASK_ROOT}/
 
 # Fail the build early if the runtime stack is broken, and confirm the
 # checkpoint loads into the architecture with no key mismatches.
-RUN python -c "import torch, timm, cv2, numpy, psycopg2, boto3; print('deps ok', torch.__version__, 'numpy', numpy.__version__)" \
+RUN python -c "import torch, timm, cv2, numpy, boto3; print('deps ok', torch.__version__, 'numpy', numpy.__version__)" \
  && python -c "import torch; from src.model import MultiHeadEfficientNet; \
 m=MultiHeadEfficientNet(4, pretrained=False); \
 ck=torch.load('/opt/model/best.pt', map_location='cpu', weights_only=False); \

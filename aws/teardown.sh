@@ -1,14 +1,11 @@
 #!/usr/bin/env bash
 # Destroy one POD scoring environment so it can be rebuilt from a clean merge.
 #
-#   DROPS THE pod_scores TABLE AND ITS VIEW. Every score computed so far is gone.
-#   There is no undo and no backup taken here.
+#   Destroys the AWS resources only. pod_scores is sarathy's table, created by
+#   sarathy's Flyway migration V198 — this project has no database access and
+#   leaves the scored data untouched.
 #
-# Order matters. The database lives in a private subnet that this shell probably
-# cannot reach, so the Lambda drops the table for us — which means the drop has
-# to happen while the function still exists, i.e. before the stack is deleted.
-#
-#   1. drop pod_scores + pod_scores_flagged   (via the Lambda, inside the VPC)
+#   1. (nothing — the database belongs to sarathy)
 #   2. delete the CloudFormation stack        (function, roles, schedules, DLQ,
 #                                              alarms, SNS topic, log group)
 #   3. delete the ECR repository and images
@@ -17,7 +14,6 @@
 # Usage:
 #   AWS_REGION=us-east-2 STAGE=stg STACK_NAME=pod-scoring-stg ./teardown.sh
 #
-#   KEEP_DATABASE=true   skip step 1 — leave pod_scores intact
 #   KEEP_ECR=true        skip step 3 — keep the repository and its images
 #   ASSUME_YES=true      skip the typed confirmation (for scripted use only)
 #
@@ -31,7 +27,6 @@ STACK_NAME="${STACK_NAME:-pod-scoring-${STAGE}}"
 ECR_REPOSITORY="${ECR_REPOSITORY:-pod-pipeline}"
 LAMBDA_FUNCTION="${LAMBDA_FUNCTION:-pod-pipeline-${STAGE}}"
 LOG_GROUP="/aws/lambda/${LAMBDA_FUNCTION}"
-KEEP_DATABASE="${KEEP_DATABASE:-false}"
 KEEP_ECR="${KEEP_ECR:-false}"
 ASSUME_YES="${ASSUME_YES:-false}"
 
@@ -48,7 +43,7 @@ cat <<EOF
     function         ${LAMBDA_FUNCTION}
     ECR repository   ${ECR_REPOSITORY}            $([ "${KEEP_ECR}" = "true" ] && echo "(KEPT)")
     log group        ${LOG_GROUP}
-    database         DROP pod_scores, pod_scores_flagged   $([ "${KEEP_DATABASE}" = "true" ] && echo "(KEPT)")
+    database         untouched — pod_scores is sarathy's (V198)
 
 EOF
 
@@ -61,37 +56,14 @@ if [[ "${ASSUME_YES}" != "true" ]]; then
 fi
 
 # --------------------------------------------------------------------------- #
-# 1. Database — while the function that can reach it still exists
+# 1. Database — NOT ours to drop
 # --------------------------------------------------------------------------- #
-if [[ "${KEEP_DATABASE}" == "true" ]]; then
-  echo "==> [1/4] KEEP_DATABASE=true — leaving pod_scores in place"
-elif ! aws lambda get-function-configuration \
-       --function-name "${LAMBDA_FUNCTION}" --region "${AWS_REGION}" >/dev/null 2>&1; then
-  echo "==> [1/4] ${LAMBDA_FUNCTION} does not exist — cannot drop the table from here."
-  echo "          If pod_scores still exists, drop it manually:"
-  echo "            DROP VIEW IF EXISTS pod_scores_flagged; DROP TABLE IF EXISTS pod_scores;"
-else
-  echo "==> [1/4] dropping pod_scores via ${LAMBDA_FUNCTION}"
-  # confirm must equal the function's own name — a payload copied from another
-  # environment cannot drop this one.
-  aws lambda invoke \
-    --function-name "${LAMBDA_FUNCTION}" --region "${AWS_REGION}" \
-    --payload "{\"migrate\": \"drop\", \"confirm\": \"${LAMBDA_FUNCTION}\"}" \
-    --cli-binary-format raw-in-base64-out /tmp/pod-teardown-drop.json >/dev/null
-  cat /tmp/pod-teardown-drop.json; echo
-  # The response "body" is a JSON string, so the raw file holds escaped quotes —
-  # parse it instead of grepping for the unescaped form.
-  if ! python3 -c '
-import json, sys
-resp = json.load(open("/tmp/pod-teardown-drop.json"))
-body = resp.get("body")
-body = json.loads(body) if isinstance(body, str) else (body or {})
-sys.exit(0 if body.get("status") == "dropped" else 1)
-'; then
-    echo "Drop did not report success. Stopping so the stack stays up and you can retry." >&2
-    exit 1
-  fi
-fi
+# pod_scores lives in sarathy's schema and is created by sarathy's Flyway
+# migration V198__pod_scores.sql. This project no longer has database access,
+# so tearing it down here is neither possible nor correct: dropping the table
+# would leave sarathy's migration history claiming it exists. If the data
+# really must go, do it from sarathy with a forward migration.
+echo "==> [1/4] pod_scores belongs to sarathy (V198) — nothing to drop from here"
 
 # --------------------------------------------------------------------------- #
 # 2. CloudFormation stack
