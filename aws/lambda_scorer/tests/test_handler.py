@@ -17,6 +17,13 @@ Covered:
   * clock-aware continuation fires only near the wall
   * sarathy being down is a 502, not a half-written run
   * preprocessing shape + normalization
+  * the S3 upload race: a 403/404/short body is retried in place because the
+    rider's upload is probably still in flight, while a 5xx or an undecodable
+    body is not — and no retry ever sleeps past the invocation's deadline
+  * the scheduled sweep asks for a rolling window longer than a day, so no
+    trip falls into the seam at midnight, and it re-attempts failed links
+  * a named date range is a backfill: that range and nothing else
+  * {"retry_failed": ...} reaches links the schedule can no longer see
 
 Pipeline-logic tests fake the model, so they run without a real checkpoint. A
 separate torch-gated test exercises the real inference wiring.
@@ -76,12 +83,15 @@ class FakeSession:
 class FakeSarathy:
     """Stands in for SarathyClient. Records every call and every row written."""
 
-    def __init__(self, trip_items=None, pages=None, fail_on=()):
+    def __init__(self, trip_items=None, pages=None, fail_on=(), retry_pages=None):
         self._trip_items = trip_items or {}
         self._pages = pages or []
+        self._retry_pages = retry_pages or []
         self._fail_on = set(fail_on)
         self.trip_calls = []
         self.range_calls = []
+        self.window_calls = []
+        self.retry_calls = []     # [(force, since, until), ...]
         self.writes = []          # [(run_date, [row, ...]), ...]
 
     # reads
@@ -96,6 +106,20 @@ class FakeSarathy:
         if "range_rows" in self._fail_on:
             raise SarathyError("sarathy unreachable")
         for page in self._pages:
+            yield [dict(r) for r in page]
+
+    def window_rows(self, from_iso, to_iso):
+        self.window_calls.append((from_iso, to_iso))
+        if "window_rows" in self._fail_on:
+            raise SarathyError("sarathy unreachable")
+        for page in self._pages:
+            yield [dict(r) for r in page]
+
+    def retry_rows(self, force=False, since=None, until=None):
+        self.retry_calls.append((force, since, until))
+        if "retry_rows" in self._fail_on:
+            raise SarathyError("sarathy unreachable")
+        for page in self._retry_pages:
             yield [dict(r) for r in page]
 
     # write
@@ -544,7 +568,7 @@ class TestBatch:
         assert H.handle_batch({}, FakeContext())["statusCode"] == 500
 
     def test_sarathy_failing_mid_run_is_a_502_reporting_partial_work(self, wired):
-        wired._fail_on = {"range_rows"}
+        wired._fail_on = {"window_rows"}
         resp = H.handle_batch({}, FakeContext())
         assert resp["statusCode"] == 502
         assert _body(resp)["status"] == "failed"
@@ -782,3 +806,265 @@ def test_real_model_scores_a_prepared_image():
     for key in ("context_valid_prob", "package_visible_prob",
                 "label_readable_prob", "image_clarity_prob"):
         assert 0.0 <= out[0][key] <= 1.0
+
+
+# --------------------------------------------------------------------------- #
+# The S3 upload race
+#
+# trip.pod is filled from presigned URLs the rider's app announces when it calls
+# /app/save-info. Nothing checks that the object is actually in S3, and the
+# upload finishes whenever the rider's connection manages it. So a 403/404 here
+# usually means "not yet", not "never" — and that is the origin of essentially
+# every download_failed row in pod_scores.
+# --------------------------------------------------------------------------- #
+
+class _FlakySession:
+    """404s a URL for the first N gets, then serves a real image."""
+
+    def __init__(self, misses, status=404, body=None):
+        self._left = misses
+        self._status = status
+        self._body = body
+        self.gets = 0
+
+    def get(self, url, timeout=None):
+        self.gets += 1
+        if self._left > 0:
+            self._left -= 1
+            return FakeResp(content=b"", status=self._status)
+        return FakeResp(content=self._body if self._body is not None else _png_bytes())
+
+
+@pytest.fixture
+def no_sleep(monkeypatch):
+    """Record the waits instead of serving them, so the suite stays fast."""
+    slept = []
+    monkeypatch.setattr(H.time, "sleep", lambda s: slept.append(s))
+    return slept
+
+
+class TestDownloadRetry:
+
+    def test_a_404_that_resolves_is_scored_not_recorded_as_a_failure(self, no_sleep):
+        session = _FlakySession(misses=1)
+        out = H.download_and_prepare(session, _row("http://a"))
+        assert "chw" in out                      # prepared tensor == success
+        assert session.gets == 2
+        assert no_sleep == [5.0]
+
+    def test_it_waits_longer_each_time(self, no_sleep):
+        session = _FlakySession(misses=2)
+        out = H.download_and_prepare(session, _row("http://a"))
+        assert "chw" in out
+        assert no_sleep == [5.0, 15.0]
+
+    def test_a_link_that_never_arrives_is_recorded_after_the_last_wait(self, no_sleep):
+        session = _FlakySession(misses=99)
+        out = H.download_and_prepare(session, _row("http://a"))
+        assert out["status"] == "download_failed"
+        assert out["failure_reason"] == "http_404"
+        assert session.gets == 3                 # first attempt + two retries
+        assert no_sleep == [5.0, 15.0]
+
+    def test_a_403_is_treated_the_same_as_a_404(self, no_sleep):
+        """S3 answers a missing key with either, depending on the bucket policy."""
+        session = _FlakySession(misses=1, status=403)
+        assert "chw" in H.download_and_prepare(session, _row("http://a"))
+        assert session.gets == 2
+
+    def test_a_truncated_body_is_retried_because_the_upload_may_be_in_flight(self, no_sleep):
+        """A 200 carrying a few bytes is a multipart upload caught halfway."""
+        tiny = _FlakySession(misses=0)
+        tiny.get = lambda url, timeout=None: FakeResp(content=b"x" * 10)
+        out = H.download_and_prepare(tiny, _row("http://a"))
+        assert out["failure_reason"] == "too_small"
+        assert no_sleep == [5.0, 15.0]           # it did keep trying
+
+    def test_a_server_error_is_not_retried_in_line(self, no_sleep):
+        """A 5xx is the host being unwell, not an upload in flight. The HTTP
+        adapter already retries those at the socket level; doing it again here
+        would only burn the invocation's clock."""
+        session = _FlakySession(misses=99, status=500)
+        out = H.download_and_prepare(session, _row("http://a"))
+        assert out["failure_reason"] == "http_500"
+        assert session.gets == 1
+        assert no_sleep == []
+
+    def test_an_undecodable_body_is_not_retried(self, no_sleep):
+        session = _FlakySession(misses=0, body=b"y" * 5000)   # big enough, not an image
+        out = H.download_and_prepare(session, _row("http://a"))
+        assert out["failure_reason"] == "decode_failed"
+        assert session.gets == 1
+        assert no_sleep == []
+
+    def test_an_image_that_is_there_first_time_never_sleeps(self, no_sleep):
+        session = _FlakySession(misses=0)
+        assert "chw" in H.download_and_prepare(session, _row("http://a"))
+        assert session.gets == 1
+        assert no_sleep == []
+
+    def test_it_will_not_sleep_past_the_deadline(self, no_sleep):
+        """A slow trip must never push the invocation into the Lambda timeout."""
+        session = _FlakySession(misses=99)
+        out = H.download_and_prepare(session, _row("http://a"),
+                                     deadline=H.time.time() + 1)
+        assert out["failure_reason"] == "http_404"
+        assert session.gets == 1
+        assert no_sleep == []
+
+    def test_a_generous_deadline_still_allows_every_retry(self, no_sleep):
+        session = _FlakySession(misses=99)
+        H.download_and_prepare(session, _row("http://a"),
+                               deadline=H.time.time() + 10_000)
+        assert session.gets == 3
+
+
+class TestDeadline:
+
+    def test_no_real_context_means_no_deadline(self):
+        assert H._deadline(FakeContext()) is None
+
+    def test_a_real_context_leaves_the_safety_margin_clear(self):
+        d = H._deadline(FakeContext(remaining_ms=300_000))
+        expected = H.time.time() + (300_000 - H.CONTINUATION_SAFETY_MS) / 1000.0
+        assert abs(d - expected) < 1.0
+
+
+# --------------------------------------------------------------------------- #
+# The scheduled sweep
+# --------------------------------------------------------------------------- #
+
+class TestSweep:
+
+    def test_an_empty_event_asks_for_a_rolling_window_not_a_day(self, wired):
+        """A run at 23:30 asking for 'today' covers to 23:30, and every trip
+        completing before midnight falls into no run at all. The window has no
+        such seam."""
+        H.handle_batch({}, FakeContext())
+        assert wired.range_calls == []
+        assert len(wired.window_calls) == 1
+        start, end = wired.window_calls[0]
+        assert start.endswith("Z") and end.endswith("Z")
+
+    def test_the_window_is_longer_than_a_day(self, wired):
+        from datetime import datetime
+        H.handle_batch({}, FakeContext())
+        start, end = wired.window_calls[0]
+        span = (datetime.fromisoformat(end.replace("Z", "+00:00"))
+                - datetime.fromisoformat(start.replace("Z", "+00:00")))
+        assert span.total_seconds() == H.SWEEP_LOOKBACK_HOURS * 3600
+        assert span.total_seconds() > 24 * 3600
+
+    def test_the_sweep_also_re_attempts_failed_links(self, wired):
+        H.handle_batch({}, FakeContext())
+        assert wired.retry_calls == [(False, None, None)]
+
+    def test_named_dates_are_a_backfill_and_skip_the_retry_pass(self, wired):
+        """A backfill of a named range should score that range and nothing else."""
+        resp = H.handle_batch({"start_date": "2026-09-01", "end_date": "2026-09-02"},
+                              FakeContext())
+        assert wired.range_calls == [("2026-09-01", "2026-09-02")]
+        assert wired.window_calls == []
+        assert wired.retry_calls == []
+        assert _body(resp)["mode"] == "backfill"
+
+    def test_the_sweep_reports_what_the_retry_pass_recovered(self, wired):
+        wired._retry_pages = [[_row("http://late-1"), _row("http://late-2")]]
+        resp = H.handle_batch({}, FakeContext())
+        assert _body(resp)["retry"] == {"attempted": 2, "recovered": 2, "still_failed": 0}
+        assert "http://late-1" in wired.written_links
+
+    def test_a_sweep_out_of_time_skips_the_retry_pass(self, wired, monkeypatch):
+        monkeypatch.setattr(H, "invoke_continuation", lambda *a: None)
+        wired._pages = [[_row(f"http://{i}") for i in range(3)]]
+        wired._retry_pages = [[_row("http://late")]]
+        H.handle_batch({}, FakeContext(remaining_ms=1))
+        assert wired.retry_calls == []
+
+    def test_a_sweep_continuation_carries_no_dates(self, wired, monkeypatch):
+        """start_date/end_date on a sweep would be instants, and resolve_range
+        would reject them on the next hop."""
+        queued = []
+        monkeypatch.setattr(H, "invoke_continuation",
+                            lambda *a: queued.append(a))
+        wired._pages = [[_row(f"http://{i}") for i in range(3)]]
+        H.handle_batch({}, FakeContext(remaining_ms=1))
+        assert queued and queued[0][3] is None
+
+    def test_a_backfill_continuation_still_carries_its_dates(self, wired, monkeypatch):
+        queued = []
+        monkeypatch.setattr(H, "invoke_continuation",
+                            lambda *a: queued.append(a))
+        wired._pages = [[_row(f"http://{i}") for i in range(3)]]
+        H.handle_batch({"start_date": "2026-09-01", "end_date": "2026-09-02"},
+                       FakeContext(remaining_ms=1))
+        assert queued[0][3] == {"start_date": "2026-09-01", "end_date": "2026-09-02"}
+
+
+# --------------------------------------------------------------------------- #
+# Retrying on demand
+# --------------------------------------------------------------------------- #
+
+class TestRetryFailedEvent:
+
+    def test_the_event_routes_to_the_retry_path(self, wired):
+        resp = H.handler({"retry_failed": True}, FakeContext())
+        assert _body(resp)["mode"] == "retry_failed"
+        assert wired.window_calls == []
+
+    def test_a_bare_true_forces_sarathys_default_window(self, wired):
+        H.handler({"retry_failed": True}, FakeContext())
+        assert wired.retry_calls == [(True, None, None)]
+
+    def test_an_explicit_window_is_passed_through(self, wired):
+        H.handler({"retry_failed": {"since": "2026-09-01T00:00:00Z",
+                                    "until": "2026-09-10T00:00:00Z"}},
+                  FakeContext())
+        assert wired.retry_calls == [
+            (True, "2026-09-01T00:00:00Z", "2026-09-10T00:00:00Z")]
+
+    def test_it_scores_and_writes_what_comes_back(self, wired):
+        wired._retry_pages = [[_row("http://x"), _row("http://y")]]
+        resp = H.handler({"retry_failed": True}, FakeContext())
+        body = _body(resp)
+        assert body["attempted"] == 2 and body["recovered"] == 2
+        assert sorted(wired.written_links) == ["http://x", "http://y"]
+
+    def test_links_that_still_are_not_there_are_counted_separately(self, wired):
+        """A link that fails again is written back as a row, never dropped —
+        that is what keeps it in the retry set for its next scheduled attempt."""
+        wired.session.http_status["http://still-missing"] = 404
+        wired._retry_pages = [[_row("http://still-missing")]]
+        resp = H.handler({"retry_failed": True}, FakeContext())
+        body = _body(resp)
+        assert body["attempted"] == 1
+        assert body["recovered"] == 0
+        assert body["still_failed"] == 1
+        assert wired.written_rows[0]["status"] == "download_failed"
+
+    def test_sarathy_being_down_is_a_502(self, wired):
+        wired._fail_on = {"retry_rows"}
+        resp = H.handler({"retry_failed": True}, FakeContext())
+        assert resp["statusCode"] == 502
+        assert _body(resp)["status"] == "failed"
+
+    def test_a_missing_base_url_is_a_500_before_any_work(self, wired, monkeypatch):
+        monkeypatch.setattr(H, "SARATHY_BASE_URL", "")
+        resp = H.handler({"retry_failed": True}, FakeContext())
+        assert resp["statusCode"] == 500
+        assert wired.retry_calls == []
+
+    def test_a_trip_event_still_wins_over_the_retry_flag(self, wired):
+        """Routing order matters: a per-trip event is the latency-sensitive path."""
+        wired._trip_items = {"9": [_row("http://t", trip_id="9")]}
+        resp = H.handler({"trip_id": 9, "retry_failed": True}, FakeContext())
+        assert _body(resp)["mode"] == "single_trip"
+
+    def test_the_retry_pass_stops_mid_walk_when_the_clock_runs_out(self, wired):
+        """The retry set can be long. Stopping between pages leaves the
+        remaining links exactly where they were — sarathy still has them
+        scheduled, so the next sweep picks them up."""
+        wired._retry_pages = [[_row("http://a")], [_row("http://b")]]
+        counts = H.run_retry_pass("2026-09-17", FakeContext(remaining_ms=1), force=True)
+        assert counts["attempted"] == 0
+        assert wired.written_links == []

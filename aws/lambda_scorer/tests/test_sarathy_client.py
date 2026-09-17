@@ -78,6 +78,13 @@ class TestConstruction:
         assert adapter.max_retries.total == 5
         assert set(adapter.max_retries.allowed_methods) >= {"GET", "POST"}
 
+    def test_a_500_is_not_retried(self):
+        """A 500 is sarathy's own query failing; repeating it just repeats the failure."""
+        forcelist = SarathyClient("http://x:8080")._session \
+            .get_adapter("http://x:8080").max_retries.status_forcelist
+        assert 500 not in forcelist
+        assert {429, 502, 503, 504} <= set(forcelist)
+
 
 # --------------------------------------------------------------------------- #
 # Envelope + error handling
@@ -177,16 +184,18 @@ class TestRangeRows:
         assert len(c._session.calls) == 1
 
     def test_the_cursor_is_carried_into_the_next_request(self):
+        """The cursor is opaque — echoed back exactly, never parsed or re-derived."""
+        token = "1789496550184627_50645055"
         c = client([
             envelope({"items": [{"awb": "A", "tripId": 1, "podLinks": ["http://a"]}],
-                      "nextCursor": 42}),
+                      "nextCursor": token}),
             envelope({"items": [{"awb": "B", "tripId": 2, "podLinks": ["http://b"]}],
                       "nextCursor": None}),
         ])
         pages = list(c.range_rows("2026-09-01", "2026-09-02"))
         assert [r["pod_link"] for page in pages for r in page] == ["http://a", "http://b"]
         assert "cursor" not in c._session.calls[0]["params"]
-        assert c._session.calls[1]["params"]["cursor"] == 42
+        assert c._session.calls[1]["params"]["cursor"] == token
 
     def test_the_date_range_and_page_size_are_sent(self):
         c = client([envelope({"items": [], "nextCursor": None})], page_size=250)
@@ -259,3 +268,98 @@ class TestWriteScores:
         rows = [{"awb": "A", "trip_id": "1", "pod_link": "http://a", "status": "scored"}]
         with pytest.raises(SarathyError, match="400"):
             c.write_scores("2026-09-10", rows)
+
+
+# --------------------------------------------------------------------------- #
+# Instant windows and the retry feed
+# --------------------------------------------------------------------------- #
+
+class TestWindowRows:
+    """The sweep asks for an instant window, not a pair of dates."""
+
+    def test_it_sends_from_and_to_not_start_and_end_date(self):
+        c = client([envelope({"items": [], "nextCursor": None})])
+        list(c.window_rows("2026-09-16T00:00:00Z", "2026-09-17T02:00:00Z"))
+        params = c._session.calls[0]["params"]
+        assert params["from"] == "2026-09-16T00:00:00Z"
+        assert params["to"] == "2026-09-17T02:00:00Z"
+        assert "startDate" not in params and "endDate" not in params
+
+    def test_it_yields_the_same_row_shape_as_a_date_range(self):
+        page = {"items": [{"awb": "AWB1", "tripId": 7,
+                           "podLinks": ["http://a", "http://b"],
+                           "alreadyScoredLinks": ["http://a"]}],
+                "nextCursor": None}
+        c = client([envelope(page)])
+        rows = next(c.window_rows("2026-09-16T00:00:00Z", "2026-09-17T00:00:00Z"))
+        assert [r["pod_link"] for r in rows] == ["http://a", "http://b"]
+        assert [r["already_scored"] for r in rows] == [True, False]
+        assert {r["trip_id"] for r in rows} == {"7"}
+
+    def test_it_walks_the_cursor_and_stops_on_null(self):
+        first = {"items": [{"awb": "A", "tripId": 1, "podLinks": ["http://1"]}],
+                 "nextCursor": "1700000000000000_1"}
+        second = {"items": [{"awb": "B", "tripId": 2, "podLinks": ["http://2"]}],
+                  "nextCursor": None}
+        c = client([envelope(first), envelope(second)])
+        pages = list(c.window_rows("2026-09-16T00:00:00Z", "2026-09-17T00:00:00Z"))
+        assert len(pages) == 2
+        # The cursor is echoed back verbatim — the client never parses it.
+        assert "cursor" not in c._session.calls[0]["params"]
+        assert c._session.calls[1]["params"]["cursor"] == "1700000000000000_1"
+
+
+class TestRetryRows:
+    """Links whose download failed, which sarathy decides are due another go."""
+
+    def test_the_scheduled_feed_sends_no_window_or_force_flag(self):
+        c = client([envelope({"items": [], "nextCursor": None})])
+        list(c.retry_rows())
+        assert c._session.calls[0]["params"] == {"limit": 500}
+        assert c._session.calls[0]["url"].endswith("/internal/pod-scoring/retry-links")
+
+    def test_a_forced_sweep_carries_the_window(self):
+        c = client([envelope({"items": [], "nextCursor": None})])
+        list(c.retry_rows(force=True, since="2026-09-01T00:00:00Z",
+                          until="2026-09-10T00:00:00Z"))
+        params = c._session.calls[0]["params"]
+        assert params["force"] == "true"
+        assert params["since"] == "2026-09-01T00:00:00Z"
+        assert params["until"] == "2026-09-10T00:00:00Z"
+
+    def test_forcing_without_a_window_lets_sarathy_pick_the_default(self):
+        c = client([envelope({"items": [], "nextCursor": None})])
+        list(c.retry_rows(force=True))
+        params = c._session.calls[0]["params"]
+        assert params["force"] == "true"
+        assert "since" not in params and "until" not in params
+
+    def test_one_row_per_link_carrying_the_attempt_count(self):
+        page = {"items": [
+            {"id": 11, "awb": "AWB1", "tripId": 7, "podLink": "http://a", "attempts": 3},
+            {"id": 12, "awb": "AWB2", "tripId": 8, "podLink": "http://b", "attempts": 1},
+        ], "nextCursor": None}
+        c = client([envelope(page)])
+        rows = next(c.retry_rows())
+        assert [r["pod_link"] for r in rows] == ["http://a", "http://b"]
+        assert [r["attempts"] for r in rows] == [3, 1]
+        # Never pre-marked as scored: the whole point is that these get another go.
+        assert all(r["already_scored"] is False for r in rows)
+
+    def test_an_item_with_no_link_is_dropped_rather_than_scored_as_none(self):
+        page = {"items": [{"id": 1, "awb": "A", "tripId": 1, "podLink": None},
+                          {"id": 2, "awb": "A", "tripId": 1, "podLink": "http://ok"}],
+                "nextCursor": None}
+        c = client([envelope(page)])
+        rows = next(c.retry_rows())
+        assert [r["pod_link"] for r in rows] == ["http://ok"]
+
+    def test_a_missing_awb_falls_back_to_the_trip_placeholder(self):
+        page = {"items": [{"id": 1, "awb": "", "tripId": 42, "podLink": "http://a"}],
+                "nextCursor": None}
+        c = client([envelope(page)])
+        assert next(c.retry_rows())[0]["awb"] == "TRIP-42"
+
+    def test_an_empty_page_yields_nothing_at_all(self):
+        c = client([envelope({"items": [], "nextCursor": None})])
+        assert list(c.retry_rows()) == []

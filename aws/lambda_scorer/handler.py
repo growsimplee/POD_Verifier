@@ -14,11 +14,28 @@ PRIMARY (event-driven, one trip):
     the instant of the request — and from sarathy otherwise. Images already scored
     are skipped. Results are posted back in one call.
 
-SECONDARY (batch, from Sarathy's admin API or a manual invoke):
-    An event with no trip_id scores a date range, paging through sarathy:
+SECONDARY (the scheduled sweep, every 30 minutes):
+    An empty event scores everything updated in the last SWEEP_LOOKBACK_HOURS (26),
+    then re-attempts POD links whose earlier download failed because the rider's
+    upload had not reached S3 yet:
+
+        {}
+
+    26 hours rather than "today" on purpose. A run at 23:30 asking for today covers
+    to 23:30, and every trip completing before midnight would fall into no run at
+    all. A rolling window has no such seam, and re-covers a run that failed.
+
+BACKFILL (manual invoke):
+    Naming dates scores exactly those days and skips the retry pass:
 
         {"start_date": "2026-09-01", "end_date": "2026-09-09"}
-        {}                                    -> today
+
+RETRY ON DEMAND (manual invoke):
+    Re-attempt failed links the scheduled sweep can no longer reach -- ones past
+    the 24h cutoff or out of attempts:
+
+        {"retry_failed": true}
+        {"retry_failed": {"since": "2026-09-01T00:00:00Z", "until": "2026-09-10T00:00:00Z"}}
 
 WARMUP:
     {"warmup": true} loads the checkpoint and returns, keeping a small pool of
@@ -41,7 +58,7 @@ import logging
 import os
 import time
 import uuid
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
 import boto3
@@ -83,6 +100,28 @@ TRIP_MAX_DOWNLOAD_WORKERS = int(os.environ.get("TRIP_MAX_DOWNLOAD_WORKERS", "8")
 WINDOW_SIZE = int(os.environ.get("WINDOW_SIZE", "800"))
 DOWNLOAD_TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT", "15"))
 MIN_CONTENT_BYTES = int(os.environ.get("MIN_CONTENT_BYTES", "500"))
+
+# How long to wait before re-trying a POD link that is not in S3 yet, in seconds.
+#
+# trip.pod is filled from presigned URLs the rider's app announces when it calls /app/save-info;
+# nothing checks that the object has actually been uploaded, and the upload itself finishes
+# whenever the rider's connection manages it. So a miss here is usually a race of a few seconds,
+# not a dead link -- which is why most download_failed rows in pod_scores exist at all.
+#
+# Waiting a flat 5-10s on every invocation would pay that cost for the ~90% of images that are
+# already there, and delay every rider's answer to help the few that are not. Retrying only the
+# ones that actually miss costs nothing in the healthy case.
+DOWNLOAD_RETRY_DELAYS = [
+    float(x) for x in os.environ.get("DOWNLOAD_RETRY_DELAYS", "5,15").split(",") if x.strip()
+]
+# Only these get a retry. A timeout or a 5xx is the source host being unwell and retrying in-line
+# just burns the invocation's clock; the HTTP adapter already retries those at the socket level.
+RETRYABLE_FAILURES = {"http_403", "http_404", "too_small"}
+
+# How far back each scheduled sweep looks. Longer than a day on purpose: it makes the run a
+# superset of "today so far", removes the midnight seam entirely, and re-covers a run that failed
+# or was throttled. Re-scoring is free -- sarathy reports what already carries a score.
+SWEEP_LOOKBACK_HOURS = int(os.environ.get("SWEEP_LOOKBACK_HOURS", "26"))
 
 # Warm-pool: how many containers a warmup ping keeps alive (1 = just this one).
 WARM_FANOUT = int(os.environ.get("WARM_FANOUT", "3"))
@@ -187,9 +226,8 @@ def preprocess_image(img_rgb: np.ndarray, size: int = INPUT_SIZE,
     return np.transpose(img, (2, 0, 1)).astype(np.float32)
 
 
-def download_and_prepare(session: requests.Session, row: dict) -> dict:
-    """Download + decode + resize one image. Always returns an outcome dict."""
-    base = {"awb": row["awb"], "trip_id": row["trip_id"], "pod_link": row["pod_link"]}
+def _fetch_once(session: requests.Session, row: dict, base: dict) -> dict:
+    """One download attempt. Returns a prepared row, or an outcome with failure_reason."""
     try:
         resp = session.get(row["pod_link"], timeout=DOWNLOAD_TIMEOUT)
         if resp.status_code != 200:
@@ -205,13 +243,41 @@ def download_and_prepare(session: requests.Session, row: dict) -> dict:
         return {**base, "status": "download_failed", "failure_reason": type(e).__name__}
 
 
+def download_and_prepare(session: requests.Session, row: dict,
+                         deadline: Optional[float] = None) -> dict:
+    """Download + decode + resize one image, waiting out an upload still in flight.
+
+    A 403, a 404 or a suspiciously small body almost always means the rider's app has told sarathy
+    the URL but has not finished putting the bytes there. Sleeping and asking again turns most of
+    those into scores instead of download_failed rows. Anything else -- a timeout, a 5xx, an
+    undecodable body -- is not a race and is returned on the first attempt.
+
+    ``deadline`` is a wall-clock time this must not sleep past, so a slow trip can never push the
+    invocation into the Lambda timeout; without one it is only bounded by DOWNLOAD_RETRY_DELAYS.
+    """
+    base = {"awb": row["awb"], "trip_id": row["trip_id"], "pod_link": row["pod_link"]}
+    out = _fetch_once(session, row, base)
+
+    for delay in DOWNLOAD_RETRY_DELAYS:
+        if "chw" in out or out.get("failure_reason") not in RETRYABLE_FAILURES:
+            break
+        if deadline is not None and time.time() + delay >= deadline:
+            logger.info("no time left to retry %s (%s)", row["pod_link"], out.get("failure_reason"))
+            break
+        time.sleep(delay)
+        out = _fetch_once(session, row, base)
+
+    return out
+
+
 def download_window(session: requests.Session, rows: list[dict],
-                    max_workers: int = MAX_DOWNLOAD_WORKERS) -> tuple[list[dict], list[dict]]:
+                    max_workers: int = MAX_DOWNLOAD_WORKERS,
+                    deadline: Optional[float] = None) -> tuple[list[dict], list[dict]]:
     """Concurrently download a window. Returns (prepared, failures)."""
     prepared, failures = [], []
     workers = min(max_workers, max(1, len(rows)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        for out in pool.map(lambda r: download_and_prepare(session, r), rows):
+        for out in pool.map(lambda r: download_and_prepare(session, r, deadline), rows):
             (prepared if "chw" in out else failures).append(out)
     return prepared, failures
 
@@ -239,16 +305,29 @@ def score_prepared(model, device, successes: list[dict]) -> list[dict]:
     return results
 
 
-def score_and_record(rows: list[dict], run_date: str, max_workers: int) -> tuple[int, int]:
+def score_and_record(rows: list[dict], run_date: str, max_workers: int,
+                     deadline: Optional[float] = None) -> tuple[int, int]:
     """Download, score and post one batch back to sarathy. Returns (scored, failed)."""
     if not rows:
         return 0, 0
     model, device = get_model()
     session = build_session(max_workers)
-    successes, failures = download_window(session, rows, max_workers)
+    successes, failures = download_window(session, rows, max_workers, deadline)
     scored = score_prepared(model, device, successes)
     get_sarathy().write_scores(run_date, scored + failures)
     return len(scored), len(failures)
+
+
+def _deadline(context: Any) -> Optional[float]:
+    """Wall-clock time after which no download retry may start.
+
+    Kept CONTINUATION_SAFETY_MS clear of the real timeout so there is room to post results and
+    return a summary after the last attempt.
+    """
+    remaining = _remaining_ms(context)
+    if remaining >= 10 ** 9:          # no real context (local, tests) -- nothing to protect
+        return None
+    return time.time() + (remaining - CONTINUATION_SAFETY_MS) / 1000.0
 
 
 # --------------------------------------------------------------------------- #
@@ -303,6 +382,8 @@ def handler(event: Any, context: Any) -> dict:
         return handle_warmup(event)
     if event.get("trip_id") not in (None, ""):
         return handle_single_trip(event, context)
+    if event.get("retry_failed"):
+        return handle_retry_failed(event, context)
     return handle_batch(event, context)
 
 
@@ -439,7 +520,8 @@ def handle_single_trip(event: dict, context: Any) -> dict:
             "invocation_duration_s": round(time.time() - t_start, 3),
         })}
 
-    scored, failed = score_and_record(pending, run_date, TRIP_MAX_DOWNLOAD_WORKERS)
+    scored, failed = score_and_record(pending, run_date, TRIP_MAX_DOWNLOAD_WORKERS,
+                                      _deadline(context))
 
     summary = {
         "run_id": run_id, "run_date": run_date, "trip_id": trip_id,
@@ -475,28 +557,117 @@ def resolve_range(event: dict) -> tuple[str, str]:
     return str(start), str(end)
 
 
+def run_retry_pass(run_date: str, context: Any, force: bool = False,
+                   since: Optional[str] = None, until: Optional[str] = None) -> dict:
+    """Re-download POD links whose earlier attempt failed, and report what recovered.
+
+    Sarathy decides which links are due — the schedule, the attempt count and the 24 hour cutoff
+    all live there. This walks what it hands back.
+
+    The counts are the point of the exercise as much as the scores are. ``recovered`` against
+    ``attempted`` is what says whether retrying is earning its keep; sarathy logs the companion
+    histogram of how long each recovery had been waiting, which is what would justify shortening
+    the retry window.
+    """
+    sarathy = get_sarathy()
+    deadline = _deadline(context)
+    attempted = recovered = still_failed = 0
+
+    for page in sarathy.retry_rows(force=force, since=since, until=until):
+        if deadline is not None and time.time() >= deadline:
+            logger.warning("retry pass stopped early: out of time after %d link(s)", attempted)
+            break
+        attempted += len(page)
+        scored, failed = score_and_record(page, run_date, MAX_DOWNLOAD_WORKERS, deadline)
+        recovered += scored
+        still_failed += failed
+
+    logger.info("POD retry sweep: attempted=%d recovered=%d still_failed=%d force=%s",
+                attempted, recovered, still_failed, force)
+    return {"attempted": attempted, "recovered": recovered, "still_failed": still_failed}
+
+
+def handle_retry_failed(event: dict, context: Any) -> dict:
+    """Re-attempt failed POD links on demand, outside the sweep's schedule.
+
+        {"retry_failed": true}
+        {"retry_failed": {"since": "2026-09-01T00:00:00Z", "until": "2026-09-10T00:00:00Z"}}
+
+    With a window it asks sarathy for every still-unscored failure that first failed in it,
+    regardless of attempts already spent or the 24 hour cutoff — the links the scheduled sweep can
+    no longer see. That is the case where something external changed and they are worth another
+    look; without it, nothing would ever revisit them.
+    """
+    t_start = time.time()
+    run_date = event.get("run_date") or date.today().isoformat()
+    run_id = event.get("run_id") or f"retry-{uuid.uuid4().hex[:8]}"
+
+    if not SARATHY_BASE_URL:
+        return {"statusCode": 500, "body": json.dumps({"error": "Missing SARATHY_BASE_URL"})}
+
+    spec = event.get("retry_failed")
+    window = spec if isinstance(spec, dict) else {}
+    since, until = window.get("since"), window.get("until")
+
+    try:
+        counts = run_retry_pass(run_date, context, force=True, since=since, until=until)
+    except SarathyError as e:
+        logger.error("run=%s retry pass aborted: %s", run_id, e)
+        return {"statusCode": 502, "body": json.dumps({
+            "error": str(e), "run_id": run_id, "status": "failed"})}
+
+    summary = {
+        "run_id": run_id, "run_date": run_date, "mode": "retry_failed",
+        "since": since, "until": until, **counts, "status": "complete",
+        "invocation_duration_s": round(time.time() - t_start, 3),
+    }
+    logger.info("Retry pass COMPLETE: %s", json.dumps(summary))
+    return {"statusCode": 200, "body": json.dumps(summary)}
+
+
 def handle_batch(event: dict, context: Any) -> dict:
     t_start = time.time()
     run_date = event.get("run_date") or date.today().isoformat()
     run_id = event.get("run_id") or f"{run_date}_{uuid.uuid4().hex[:8]}"
     continuation = int(event.get("continuation", 0))
+    deadline = _deadline(context)
 
     if not SARATHY_BASE_URL:
         return {"statusCode": 500, "body": json.dumps({"error": "Missing SARATHY_BASE_URL"})}
 
-    try:
-        start_date, end_date = resolve_range(event)
-    except ValueError as e:
-        logger.error("Bad batch request: %s", e)
-        return {"statusCode": 400, "body": json.dumps({"error": str(e), "run_id": run_id})}
-    logger.info("run=%s batch range=%s..%s continuation=%d",
-                run_id, start_date, end_date, continuation)
+    # An event naming dates is a manual backfill over whole days. An empty one is the scheduled
+    # sweep, which asks for the last SWEEP_LOOKBACK_HOURS instead: longer than a day so that every
+    # trip completing today is covered by some run, with no seam at midnight and no dependence on
+    # any single run having succeeded.
+    explicit_range = bool(event.get("start_date") or event.get("end_date"))
+    sweeping = not explicit_range
+
+    if explicit_range:
+        try:
+            start_date, end_date = resolve_range(event)
+        except ValueError as e:
+            logger.error("Bad batch request: %s", e)
+            return {"statusCode": 400, "body": json.dumps({"error": str(e), "run_id": run_id})}
+        feed = get_sarathy().range_rows(start_date, end_date)
+        window_from = window_to = None
+        logger.info("run=%s backfill range=%s..%s continuation=%d",
+                    run_id, start_date, end_date, continuation)
+    else:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        window_to = now.isoformat().replace("+00:00", "Z")
+        window_from = (now - timedelta(hours=SWEEP_LOOKBACK_HOURS)) \
+            .isoformat().replace("+00:00", "Z")
+        start_date, end_date = window_from, window_to
+        feed = get_sarathy().window_rows(window_from, window_to)
+        logger.info("run=%s sweep window=%s..%s continuation=%d",
+                    run_id, window_from, window_to, continuation)
 
     total = skipped_total = scored_total = failed_total = 0
     hit_time_limit = False
+    retry_counts: dict = {}
 
     try:
-        for page in get_sarathy().range_rows(start_date, end_date):
+        for page in feed:
             total += len(page)
             # Sarathy flags what it has already scored, which is also what makes a
             # continuation resume: re-paging the range costs a query and skips the
@@ -508,14 +679,20 @@ def handle_batch(event: dict, context: Any) -> dict:
                 if _remaining_ms(context) < CONTINUATION_SAFETY_MS:
                     hit_time_limit = True
                     break
-                window = pending[w:w + WINDOW_SIZE]
-                scored, failed = score_and_record(window, run_date, MAX_DOWNLOAD_WORKERS)
+                chunk = pending[w:w + WINDOW_SIZE]
+                scored, failed = score_and_record(chunk, run_date, MAX_DOWNLOAD_WORKERS, deadline)
                 scored_total += scored
                 failed_total += failed
                 logger.info("window %d-%d done (scored=%d failed=%d)",
-                            w, w + len(window), scored_total, failed_total)
+                            w, w + len(chunk), scored_total, failed_total)
             if hit_time_limit:
                 break
+
+        # Second pass: links an earlier run could not download because the rider's upload had not
+        # landed yet. Only on the scheduled sweep -- a manual backfill of a named date range should
+        # score that range and nothing else.
+        if sweeping and not hit_time_limit:
+            retry_counts = run_retry_pass(run_date, context)
     except SarathyError as e:
         logger.error("run=%s aborted: %s", run_id, e)
         return {"statusCode": 502, "body": json.dumps({
@@ -523,16 +700,23 @@ def handle_batch(event: dict, context: Any) -> dict:
             "scored_this_invocation": scored_total, "failed_this_invocation": failed_total})}
 
     if hit_time_limit and continuation < MAX_CONTINUATIONS:
+        # A backfill's continuation must resume the same named days. A sweep's must NOT carry the
+        # window forward as start_date/end_date -- those are instants, not dates, and resolve_range
+        # would reject them. It simply re-sweeps, which lands on a window shifted by however long
+        # the first attempt took and re-covers everything the earlier pass already scored, because
+        # sarathy reports those links as done.
         invoke_continuation(run_id, run_date, continuation + 1,
-                            {"start_date": start_date, "end_date": end_date})
+                            None if sweeping else {"start_date": start_date, "end_date": end_date})
         status = "continuing"
     else:
         emit_coverage(total, scored_total + skipped_total, failed_total)
         status = "incomplete" if hit_time_limit else "complete"
 
     summary = {
-        "run_id": run_id, "run_date": run_date, "mode": "batch",
+        "run_id": run_id, "run_date": run_date,
+        "mode": "sweep" if sweeping else "backfill",
         "start_date": start_date, "end_date": end_date,
+        "retry": retry_counts,
         "total_images": total,
         "skipped_already_scored": skipped_total,
         "scored_this_invocation": scored_total,
