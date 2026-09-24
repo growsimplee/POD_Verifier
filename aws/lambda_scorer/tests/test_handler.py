@@ -92,6 +92,7 @@ class FakeSarathy:
         self.range_calls = []
         self.window_calls = []
         self.retry_calls = []     # [(force, since, until), ...]
+        self.pass_order = []      # "retry" / "trips", in the order each feed was walked
         self.writes = []          # [(run_date, [row, ...]), ...]
 
     # reads
@@ -110,6 +111,7 @@ class FakeSarathy:
 
     def window_rows(self, from_iso, to_iso):
         self.window_calls.append((from_iso, to_iso))
+        self.pass_order.append("trips")
         if "window_rows" in self._fail_on:
             raise SarathyError("sarathy unreachable")
         for page in self._pages:
@@ -117,6 +119,7 @@ class FakeSarathy:
 
     def retry_rows(self, force=False, since=None, until=None):
         self.retry_calls.append((force, since, until))
+        self.pass_order.append("retry")
         if "retry_rows" in self._fail_on:
             raise SarathyError("sarathy unreachable")
         for page in self._retry_pages:
@@ -145,6 +148,20 @@ class FakeContext:
 
     def get_remaining_time_in_millis(self):
         return self._remaining
+
+
+class DrainingContext:
+    """A clock that runs down: yields each value in turn, then sticks on the last.
+
+    Lets a test give the retry pass a real budget and still have the trips sweep hit the wall,
+    which is the exact situation the reordering exists for.
+    """
+
+    def __init__(self, values_ms):
+        self._values = list(values_ms)
+
+    def get_remaining_time_in_millis(self):
+        return self._values.pop(0) if len(self._values) > 1 else self._values[0]
 
 
 def _row(link, awb="AWB1", trip_id="1", already=False):
@@ -974,12 +991,76 @@ class TestSweep:
         assert _body(resp)["retry"] == {"attempted": 2, "recovered": 2, "still_failed": 0}
         assert "http://late-1" in wired.written_links
 
-    def test_a_sweep_out_of_time_skips_the_retry_pass(self, wired, monkeypatch):
+    def test_the_retry_pass_runs_even_when_the_trips_sweep_hits_the_wall(self, wired, monkeypatch):
+        """The regression test for the bug this ordering fixes.
+
+        The retry pass used to run last, gated on `not hit_time_limit`. On production that meant
+        it never ran at all: the trips sweep had a backlog, used the whole invocation every time,
+        and handed off to a continuation. Links kept failing, sarathy kept scheduling retries, and
+        nothing ever drained them until they expired at 24 hours.
+        """
         monkeypatch.setattr(H, "invoke_continuation", lambda *a: None)
         wired._pages = [[_row(f"http://{i}") for i in range(3)]]
+        wired._retry_pages = [[_row("http://late-1"), _row("http://late-2")]]
+
+        # Plenty of clock for the retry pass; none left by the time the trips sweep looks.
+        resp = H.handle_batch({}, DrainingContext([600_000, 600_000, 1]))
+
+        assert wired.retry_calls == [(False, None, None)]
+        assert _body(resp)["retry"]["recovered"] == 2
+        assert sorted(wired.written_links) == ["http://late-1", "http://late-2"]
+        assert _body(resp)["status"] == "continuing"   # the trips sweep did hit the wall
+
+    def test_the_retry_pass_runs_before_the_trips_sweep(self, wired):
+        """Order matters, not just presence.
+
+        What the retry pass misses expires; what the trips sweep misses is picked up by the next
+        run, because continuations exist for exactly that. So the expiring work gets first claim
+        on the clock and the resumable work takes what is left -- not the other way round.
+        """
+        wired._pages = [[_row("http://trip")]]
         wired._retry_pages = [[_row("http://late")]]
-        H.handle_batch({}, FakeContext(remaining_ms=1))
-        assert wired.retry_calls == []
+
+        H.handle_batch({}, FakeContext())
+
+        assert wired.pass_order == ["retry", "trips"]
+
+    def test_a_failing_retry_pass_does_not_abort_the_trips_sweep(self, wired):
+        """Scoring today's trips is the primary job and must survive a broken retry feed.
+
+        Running last, a failing retry pass could not affect the sweep. Running first it could, so
+        its failure is contained rather than propagated.
+        """
+        wired._fail_on = {"retry_rows"}
+        wired._pages = [[_row("http://trip-a"), _row("http://trip-b")]]
+
+        resp = H.handle_batch({}, FakeContext())
+
+        assert resp["statusCode"] == 200
+        assert _body(resp)["status"] == "complete"
+        assert sorted(wired.written_links) == ["http://trip-a", "http://trip-b"]
+        assert "error" in _body(resp)["retry"]
+
+    def test_the_retry_pass_gets_a_slice_of_the_clock_not_all_of_it(self):
+        """"First" must not turn into "instead of".
+
+        A large retry backlog could otherwise eat the whole invocation and starve the trips sweep
+        across every continuation -- the same starvation, pointed the other way.
+        """
+        ctx = FakeContext(remaining_ms=300_000)
+        usable = (300_000 - H.CONTINUATION_SAFETY_MS) / 1000.0
+
+        full = H._deadline(ctx) - H.time.time()
+        slice_ = H._deadline(ctx, H.RETRY_TIME_SHARE) - H.time.time()
+
+        assert abs(full - usable) < 1.0
+        assert abs(slice_ - usable * H.RETRY_TIME_SHARE) < 1.0
+        assert 0 < slice_ < full
+
+    def test_a_spent_clock_leaves_a_non_negative_budget(self):
+        """Past the safety margin the share must clamp at zero, never go backwards in time."""
+        d = H._deadline(FakeContext(remaining_ms=1), H.RETRY_TIME_SHARE)
+        assert d >= H.time.time() - 1.0
 
     def test_a_sweep_continuation_carries_no_dates(self, wired, monkeypatch):
         """start_date/end_date on a sweep would be instants, and resolve_range

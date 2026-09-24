@@ -15,11 +15,16 @@ PRIMARY (event-driven, one trip):
     are skipped. Results are posted back in one call.
 
 SECONDARY (the scheduled sweep, every 30 minutes):
-    An empty event scores everything updated in the last SWEEP_LOOKBACK_HOURS (26),
-    then re-attempts POD links whose earlier download failed because the rider's
-    upload had not reached S3 yet:
+    An empty event first re-attempts POD links whose earlier download failed because
+    the rider's upload had not reached S3 yet, then scores everything updated in the
+    last SWEEP_LOOKBACK_HOURS (26):
 
         {}
+
+    Retries go first because what they miss EXPIRES — sarathy stops offering a link
+    24 hours after its first failure — while the trips sweep is resumable, picked up
+    by the next run or a continuation. The retry pass is capped at RETRY_TIME_SHARE
+    of the invocation so it cannot starve the sweep in turn.
 
     26 hours rather than "today" on purpose. A run at 23:30 asking for today covers
     to 23:30, and every trip completing before midnight would fall into no run at
@@ -122,6 +127,14 @@ RETRYABLE_FAILURES = {"http_403", "http_404", "too_small"}
 # superset of "today so far", removes the midnight seam entirely, and re-covers a run that failed
 # or was throttled. Re-scoring is free -- sarathy reports what already carries a score.
 SWEEP_LOOKBACK_HOURS = int(os.environ.get("SWEEP_LOOKBACK_HOURS", "26"))
+
+# The share of a sweep invocation the retry pass may use before the trips sweep starts.
+#
+# The retry pass runs first because what it misses expires, while the trips sweep is resumable.
+# But "first" must not become "instead of": a large retry backlog could otherwise consume the
+# whole invocation and starve the trips sweep across every continuation. A third leaves the
+# majority of the clock to the primary job while guaranteeing the expiring work a real slice.
+RETRY_TIME_SHARE = float(os.environ.get("RETRY_TIME_SHARE", "0.34"))
 
 # Warm-pool: how many containers a warmup ping keeps alive (1 = just this one).
 WARM_FANOUT = int(os.environ.get("WARM_FANOUT", "3"))
@@ -318,16 +331,20 @@ def score_and_record(rows: list[dict], run_date: str, max_workers: int,
     return len(scored), len(failures)
 
 
-def _deadline(context: Any) -> Optional[float]:
+def _deadline(context: Any, share: float = 1.0) -> Optional[float]:
     """Wall-clock time after which no download retry may start.
 
     Kept CONTINUATION_SAFETY_MS clear of the real timeout so there is room to post results and
     return a summary after the last attempt.
+
+    ``share`` carves out a fraction of what is left for one pass, so a pass that runs first
+    cannot consume the whole invocation and starve whatever runs after it.
     """
     remaining = _remaining_ms(context)
     if remaining >= 10 ** 9:          # no real context (local, tests) -- nothing to protect
         return None
-    return time.time() + (remaining - CONTINUATION_SAFETY_MS) / 1000.0
+    usable = (remaining - CONTINUATION_SAFETY_MS) / 1000.0
+    return time.time() + max(0.0, usable * share)
 
 
 # --------------------------------------------------------------------------- #
@@ -558,11 +575,15 @@ def resolve_range(event: dict) -> tuple[str, str]:
 
 
 def run_retry_pass(run_date: str, context: Any, force: bool = False,
-                   since: Optional[str] = None, until: Optional[str] = None) -> dict:
+                   since: Optional[str] = None, until: Optional[str] = None,
+                   deadline: Optional[float] = None) -> dict:
     """Re-download POD links whose earlier attempt failed, and report what recovered.
 
     Sarathy decides which links are due — the schedule, the attempt count and the 24 hour cutoff
     all live there. This walks what it hands back.
+
+    ``deadline`` bounds the pass when the caller wants it to have only part of the invocation;
+    without one it may use everything up to the continuation margin.
 
     The counts are the point of the exercise as much as the scores are. ``recovered`` against
     ``attempted`` is what says whether retrying is earning its keep; sarathy logs the companion
@@ -570,7 +591,8 @@ def run_retry_pass(run_date: str, context: Any, force: bool = False,
     the retry window.
     """
     sarathy = get_sarathy()
-    deadline = _deadline(context)
+    if deadline is None:
+        deadline = _deadline(context)
     attempted = recovered = still_failed = 0
 
     for page in sarathy.retry_rows(force=force, since=since, until=until):
@@ -667,6 +689,34 @@ def handle_batch(event: dict, context: Any) -> dict:
     retry_counts: dict = {}
 
     try:
+        # FIRST PASS: links an earlier run could not download because the rider's upload had not
+        # landed in S3 yet. Only on the scheduled sweep -- a manual backfill of a named date range
+        # should score that range and nothing else.
+        #
+        # THIS RUNS BEFORE THE TRIPS SWEEP, and that ordering is the whole point. It used to run
+        # after, gated on `not hit_time_limit`, which meant it was skipped on any run where the
+        # trips sweep used up the clock. In production that was EVERY run: the sweep had a backlog,
+        # hit the 15-minute wall each time, handed off to a continuation, and the retry pass never
+        # executed once. Meanwhile sarathy kept recording next_retry_at on every failed link, so a
+        # queue built up with nothing draining it, and those links expired 24 hours after their
+        # first failure.
+        #
+        # The two passes are not equals. The trips sweep is unbounded and RESUMABLE -- that is what
+        # continuations are for, and anything it misses this run it picks up next run. The retry
+        # pass is bounded (by the 24h window and six attempts) and EXPIRING -- what it misses is
+        # gone. Giving the resumable work first claim on the clock and the expiring work whatever
+        # was left over had it exactly backwards.
+        if sweeping:
+            try:
+                retry_counts = run_retry_pass(
+                    run_date, context, deadline=_deadline(context, RETRY_TIME_SHARE))
+            except SarathyError as e:
+                # The trips sweep is the primary job and must still run. Before the reorder a
+                # failing retry pass could not affect it, because it came last; now it could, so
+                # it is contained here rather than aborting the invocation.
+                logger.error("retry pass failed, continuing to the trips sweep: %s", e)
+                retry_counts = {"error": str(e)}
+
         for page in feed:
             total += len(page)
             # Sarathy flags what it has already scored, which is also what makes a
@@ -687,12 +737,6 @@ def handle_batch(event: dict, context: Any) -> dict:
                             w, w + len(chunk), scored_total, failed_total)
             if hit_time_limit:
                 break
-
-        # Second pass: links an earlier run could not download because the rider's upload had not
-        # landed yet. Only on the scheduled sweep -- a manual backfill of a named date range should
-        # score that range and nothing else.
-        if sweeping and not hit_time_limit:
-            retry_counts = run_retry_pass(run_date, context)
     except SarathyError as e:
         logger.error("run=%s aborted: %s", run_id, e)
         return {"statusCode": 502, "body": json.dumps({
