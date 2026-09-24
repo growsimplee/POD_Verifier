@@ -861,6 +861,18 @@ def no_sleep(monkeypatch):
 
 
 class TestDownloadRetry:
+    """The in-line retry MECHANISM, exercised with delays configured.
+
+    DOWNLOAD_RETRY_DELAYS ships EMPTY -- see the constant's comment and
+    TestInLineRetryIsOffByDefault below. These tests pin it to the old "5,15" because what
+    they cover is the loop itself: which failure reasons are retryable, that the waits
+    lengthen, that the deadline is respected. All of that must keep working for the day a
+    source is genuinely racy on a seconds timescale and someone sets the variable.
+    """
+
+    @pytest.fixture(autouse=True)
+    def with_delays(self, monkeypatch):
+        monkeypatch.setattr(H, "DOWNLOAD_RETRY_DELAYS", [5.0, 15.0])
 
     def test_a_404_that_resolves_is_scored_not_recorded_as_a_failure(self, no_sleep):
         session = _FlakySession(misses=1)
@@ -934,6 +946,48 @@ class TestDownloadRetry:
         H.download_and_prepare(session, _row("http://a"),
                                deadline=H.time.time() + 10_000)
         assert session.gets == 3
+
+
+class TestInLineRetryIsOffByDefault:
+    """The shipped default performs exactly one fetch per link.
+
+    Waiting in line was costing the sweep its entire budget: download_window sizes its pool
+    to the window, a page that is ~95% already-scored leaves one or two new links, and a
+    single 403 then held one worker asleep for 5+15s with nothing to overlap it. Measured in
+    production, sweeps spent all 810s of their budget and never finished a window.
+
+    It also could not have worked. The links are destinations the rider's app uploads to
+    later, not presigned URLs that expire: a forced retry on 2026-09-24 recovered 10,263 of
+    10,270 links that had been failing for up to nine days, every one on the first fetch. The
+    upload lands hours or days later, so a twenty-second wait buys nothing. Failing fast and
+    letting the scheduled retry pass revisit in thirty minutes is the behaviour that matches
+    how the images actually arrive.
+    """
+
+    def test_the_shipped_default_is_empty(self):
+        assert H.DOWNLOAD_RETRY_DELAYS == []
+
+    def test_a_missing_image_is_fetched_once_and_recorded(self, no_sleep):
+        session = _FlakySession(misses=99, status=403)
+        out = H.download_and_prepare(session, _row("http://a"))
+        assert out["status"] == "download_failed"
+        assert out["failure_reason"] == "http_403"
+        assert session.gets == 1
+        assert no_sleep == []
+
+    def test_an_image_that_would_have_arrived_on_the_second_try_is_not_waited_for(self, no_sleep):
+        """Deliberate: the scheduled retry pass picks it up, the invocation keeps its clock."""
+        session = _FlakySession(misses=1)
+        out = H.download_and_prepare(session, _row("http://a"))
+        assert out["status"] == "download_failed"
+        assert session.gets == 1
+        assert no_sleep == []
+
+    def test_a_present_image_is_unaffected(self, no_sleep):
+        session = _FlakySession(misses=0)
+        assert "chw" in H.download_and_prepare(session, _row("http://a"))
+        assert session.gets == 1
+        assert no_sleep == []
 
 
 class TestDeadline:

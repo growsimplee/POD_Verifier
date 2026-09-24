@@ -106,18 +106,32 @@ WINDOW_SIZE = int(os.environ.get("WINDOW_SIZE", "800"))
 DOWNLOAD_TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT", "15"))
 MIN_CONTENT_BYTES = int(os.environ.get("MIN_CONTENT_BYTES", "500"))
 
-# How long to wait before re-trying a POD link that is not in S3 yet, in seconds.
+# How long to wait before re-fetching a POD link that is not in the bucket yet, in seconds.
+# EMPTY BY DEFAULT, because there is nothing worth waiting for.
 #
-# trip.pod is filled from presigned URLs the rider's app announces when it calls /app/save-info;
-# nothing checks that the object has actually been uploaded, and the upload itself finishes
-# whenever the rider's connection manages it. So a miss here is usually a race of a few seconds,
-# not a dead link -- which is why most download_failed rows in pod_scores exist at all.
+# trip.pod holds the URL the image is EXPECTED to land at. The rider's app announces it at
+# /app/save-info before the upload has happened and a background task keeps pushing until it
+# succeeds; the bucket denies listing, so a key that has not arrived answers 403, not 404.
 #
-# Waiting a flat 5-10s on every invocation would pay that cost for the ~90% of images that are
-# already there, and delay every rider's answer to help the few that are not. Retrying only the
-# ones that actually miss costs nothing in the healthy case.
+# This was "5,15" on the belief that the miss was a race of a few seconds. Production says
+# otherwise. On 2026-09-24 a forced retry recovered 10,263 of 10,270 links that had been failing
+# for up to NINE DAYS, and every one came back on the FIRST fetch -- 09-16 recovered 1044/1044.
+# The upload lands hours or days later. It never lands within twenty seconds, so the wait could
+# not succeed even in principle.
+#
+# The cost of being wrong about that was the entire sweep. download_window sizes its pool to the
+# window -- min(max_workers, len(rows)) -- and a page that is ~95% already-scored leaves one or
+# two new links, so a single 403 held ONE worker asleep for 5+15s with no concurrency to hide it.
+# Measured in prod: consecutive "window 0-1 done" lines 20.1s apart, ~33.5k images enumerated per
+# invocation to do ~1.1k of real work, every sweep spending its full 810s budget and ending
+# CONTINUING, chains hitting MAX_CONTINUATIONS without ever finishing their window, and roughly
+# half the day's completed trips going unscored as a result.
+#
+# So: fail fast, and let the scheduled retry pass revisit the link thirty minutes later, which is
+# the timescale the upload actually works on. Set this to "5,15" to restore the old behaviour if
+# a source ever turns out to be genuinely racy on a seconds timescale.
 DOWNLOAD_RETRY_DELAYS = [
-    float(x) for x in os.environ.get("DOWNLOAD_RETRY_DELAYS", "5,15").split(",") if x.strip()
+    float(x) for x in os.environ.get("DOWNLOAD_RETRY_DELAYS", "").split(",") if x.strip()
 ]
 # Only these get a retry. A timeout or a 5xx is the source host being unwell and retrying in-line
 # just burns the invocation's clock; the HTTP adapter already retries those at the socket level.
