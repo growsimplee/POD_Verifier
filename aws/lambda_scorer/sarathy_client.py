@@ -38,7 +38,13 @@ class SarathyClient:
         adapter = requests.adapters.HTTPAdapter(
             max_retries=requests.adapters.Retry(
                 total=retries, backoff_factor=0.5,
-                status_forcelist=[429, 500, 502, 503, 504],
+                # 500 is deliberately NOT retried. Sarathy returns it for a query that failed on its
+                # own terms -- a statement timeout, say -- and repeating that query repeats the
+                # failure while charging its full cost to the database again. A batch read that
+                # timed out once turned into four identical timeouts here, every 30 minutes, until
+                # the query behind it was fixed. The codes left are the ones that mean "try again":
+                # rate limiting and the load balancer failing to reach an instance.
+                status_forcelist=[429, 502, 503, 504],
                 allowed_methods=["GET", "POST"],   # the write is idempotent, so retrying is safe
             ),
         )
@@ -87,31 +93,96 @@ class SarathyClient:
         item = self._call("GET", f"/trips/{trip_id}")
         return self._rows(item or {}, trip_id_override=trip_id)
 
-    def range_rows(self, start_date: str, end_date: str) -> Iterator[list[dict]]:
-        """Page through a date range, yielding one page of rows at a time.
+    def _paged(self, path: str, params: dict, label: str) -> Iterator[list[dict]]:
+        """Walk a keyset-paginated endpoint, yielding one page of API items at a time.
 
-        A generator rather than a list: a wide range is exactly the case where holding every row
+        A generator rather than a list: a wide window is exactly the case where holding every row
         in memory is the thing to avoid, and the caller already scores in windows.
+
+        The cursor is an opaque token — echo sarathy's ``nextCursor`` back verbatim and stop when
+        it comes back null. It used to be a trip id and is now a (timestamp, id) pair; treating it
+        as opaque is why that change did not reach this file. The same token shape serves the trip
+        feed and both retry feeds, so this one loop covers all three.
         """
-        cursor: Optional[int] = None
+        cursor: Optional[str] = None
         pages = 0
         while True:
-            params = {"startDate": start_date, "endDate": end_date, "limit": self.page_size}
+            page_params = dict(params, limit=self.page_size)
             if cursor is not None:
-                params["cursor"] = cursor
-            page = self._call("GET", "/trips", params=params) or {}
+                page_params["cursor"] = cursor
+            page = self._call("GET", path, params=page_params) or {}
 
-            rows: list[dict] = []
-            for item in page.get("items") or []:
-                rows.extend(self._rows(item))
+            items = page.get("items") or []
             pages += 1
-            if rows:
-                yield rows
+            if items:
+                yield items
 
             cursor = page.get("nextCursor")
             if cursor is None:
-                logger.info("sarathy: range exhausted after %d page(s)", pages)
+                logger.info("sarathy: %s exhausted after %d page(s)", label, pages)
                 return
+
+    def range_rows(self, start_date: str, end_date: str) -> Iterator[list[dict]]:
+        """Page through a date range — whole days, end inclusive. Used by manual backfills."""
+        for items in self._paged("/trips",
+                                 {"startDate": start_date, "endDate": end_date},
+                                 f"range {start_date}..{end_date}"):
+            rows: list[dict] = []
+            for item in items:
+                rows.extend(self._rows(item))
+            if rows:
+                yield rows
+
+    def window_rows(self, from_iso: str, to_iso: str) -> Iterator[list[dict]]:
+        """Page through an exact instant window, upper bound exclusive.
+
+        What the half-hourly sweep uses. Days are the wrong unit for it: a run at 23:30 asking for
+        "today" covers to 23:30, and every trip completing between then and midnight would fall
+        into no run at all, because the next day's runs look at the next day's timestamps. Asking
+        for the last N hours instead has no such seam.
+        """
+        for items in self._paged("/trips", {"from": from_iso, "to": to_iso},
+                                 f"window {from_iso}..{to_iso}"):
+            rows: list[dict] = []
+            for item in items:
+                rows.extend(self._rows(item))
+            if rows:
+                yield rows
+
+    def retry_rows(self, force: bool = False,
+                   since: Optional[str] = None,
+                   until: Optional[str] = None) -> Iterator[list[dict]]:
+        """Page through POD links whose download failed and which are due another attempt.
+
+        These are mostly not broken links. sarathy records the presigned URLs the rider's app
+        announces when it calls /app/save-info, before the image has finished uploading, so a
+        failure usually means the photo had not landed in S3 yet. Sarathy owns the schedule — it
+        decides which links are due — and this just walks what it hands back.
+
+        ``force`` abandons that schedule and asks for every still-unscored failure in an explicit
+        window, for links the scheduled sweep can no longer reach.
+        """
+        params: dict = {}
+        if force:
+            params["force"] = "true"
+            if since:
+                params["since"] = since
+            if until:
+                params["until"] = until
+
+        for items in self._paged("/retry-links", params,
+                                 "forced retry set" if force else "retry set"):
+            rows = [
+                {"awb": str(item.get("awb") or "").strip() or f"TRIP-{item.get('tripId')}",
+                 "trip_id": str(item.get("tripId") or ""),
+                 "pod_link": item.get("podLink"),
+                 "attempts": int(item.get("attempts") or 0),
+                 "already_scored": False}
+                for item in items
+                if item.get("podLink")
+            ]
+            if rows:
+                yield rows
 
     # ------------------------------------------------------------------ #
     # Write

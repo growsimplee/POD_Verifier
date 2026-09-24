@@ -289,10 +289,17 @@ so exposing them publicly would expose an unauthenticated write.
 **The `trip` table, not `kaptaan`.** `kaptaan` is a derived, analytics-shaped
 table rebuilt by a pipeline, so it lags — and on staging that pipeline does not
 run at all, leaving it empty. Sarathy reads the live `trip` table for both the
-single-trip and the range query, dated on `COALESCE(closed_at, updated_at)` —
-when the trip reached its final state, which is when its POD was captured.
-`created_at` would date a trip to when it was *planned*, pulling in trips whose
-photos do not exist yet.
+single-trip and the range query, dated on
+`COALESCE(closed_at AT TIME ZONE 'UTC', updated_at)` — when the trip reached its
+final state, which is when its POD was captured. `created_at` would date a trip
+to when it was *planned*, pulling in trips whose photos do not exist yet.
+
+The range query is keyset-paginated on `(completed_at, trip_id)` and served by a
+partial index on the same expression (sarathy's `V200`). Its first shape
+filtered on the date but ordered by `trip_id`, which no index could serve: on
+prod's ~50M-row `trip` table every batch run hit the statement timeout and
+scored nothing. `nextCursor` is an opaque token because of that change — echo it
+back, never parse it.
 
 **Never filter on `kaptaan.metadata`.** The column is there, but the prod
 pipeline stopped populating it, so `metadata->>'podVerificationStatus'` matches

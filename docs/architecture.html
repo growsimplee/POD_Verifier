@@ -1,0 +1,881 @@
+<title>POD Scoring Pipeline</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chivo:wght@400;700;900&family=IBM+Plex+Mono:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap">
+
+<style>
+  :root {
+    --paper:      #E9EEEE;
+    --surface:    #FDFEFE;
+    --surface-2:  #F2F6F6;
+    --ink:        #0F1A1D;
+    --ink-2:      #3D4F52;
+    --ink-3:      #6B7D80;
+    --rule:       #CBD7D7;
+    --rule-soft:  #DDE6E6;
+    --teal:       #0E6B6A;
+    --teal-soft:  #D3E6E5;
+    --amber:      #A96B10;
+    --amber-soft: #F6E6CA;
+    --pass:       #2A6B4F;
+    --flag:       #A33A24;
+    --flag-soft:  #F4DCD6;
+
+    --display: "Chivo", "Helvetica Neue", Arial, sans-serif;
+    --body:    "Source Serif 4", Georgia, "Times New Roman", serif;
+    --mono:    "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper:      #0C1416;
+      --surface:    #121D20;
+      --surface-2:  #162427;
+      --ink:        #E6EDED;
+      --ink-2:      #B3C3C4;
+      --ink-3:      #7F9395;
+      --rule:       #274044;
+      --rule-soft:  #1D3134;
+      --teal:       #5CC7C0;
+      --teal-soft:  #16383A;
+      --amber:      #E0A44F;
+      --amber-soft: #382C15;
+      --pass:       #6DBD95;
+      --flag:       #E8836A;
+      --flag-soft:  #3A1F19;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper:      #0C1416;
+    --surface:    #121D20;
+    --surface-2:  #162427;
+    --ink:        #E6EDED;
+    --ink-2:      #B3C3C4;
+    --ink-3:      #7F9395;
+    --rule:       #274044;
+    --rule-soft:  #1D3134;
+    --teal:       #5CC7C0;
+    --teal-soft:  #16383A;
+    --amber:      #E0A44F;
+    --amber-soft: #382C15;
+    --pass:       #6DBD95;
+    --flag:       #E8836A;
+    --flag-soft:  #3A1F19;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--body);
+    font-size: 17px;
+    line-height: 1.62;
+    padding-block: 0 72px;
+    padding-inline: 16px;
+    margin: 0;
+  }
+
+  .wrap { max-width: 860px; margin: 0 auto; }
+
+  /* ---------- masthead ---------- */
+
+  .masthead {
+    padding-block: 48px 30px;
+    border-bottom: 3px solid var(--ink);
+  }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--teal);
+    margin: 0 0 14px;
+  }
+  h1 {
+    font-family: var(--display);
+    font-weight: 900;
+    font-size: clamp(34px, 7.5vw, 58px);
+    line-height: 1.02;
+    letter-spacing: -0.025em;
+    margin: 0 0 18px;
+    text-wrap: balance;
+  }
+  .standfirst {
+    font-size: clamp(17px, 2.4vw, 20px);
+    color: var(--ink-2);
+    margin: 0;
+    max-width: 62ch;
+  }
+  .byline {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 22px;
+    margin-top: 26px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: 0.04em;
+    color: var(--ink-3);
+  }
+  .byline b { color: var(--ink-2); font-weight: 600; }
+
+  /* ---------- sections ---------- */
+
+  section { padding-block: 44px 0; }
+
+  h2 {
+    font-family: var(--display);
+    font-weight: 700;
+    font-size: clamp(23px, 3.6vw, 30px);
+    line-height: 1.15;
+    letter-spacing: -0.015em;
+    margin: 0 0 6px;
+    text-wrap: balance;
+  }
+  h2 .num {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--teal);
+    letter-spacing: 0.1em;
+    display: block;
+    margin-bottom: 8px;
+  }
+  h3 {
+    font-family: var(--display);
+    font-weight: 700;
+    font-size: 17px;
+    letter-spacing: 0.005em;
+    margin: 30px 0 4px;
+  }
+  p { margin: 0 0 16px; max-width: 66ch; }
+  .lede { color: var(--ink-2); max-width: 66ch; margin-bottom: 22px; }
+
+  code, .m {
+    font-family: var(--mono);
+    font-size: 0.855em;
+    background: var(--surface-2);
+    border: 1px solid var(--rule-soft);
+    border-radius: 3px;
+    padding: 1px 5px;
+    color: var(--ink);
+    white-space: nowrap;
+  }
+
+  a { color: var(--teal); text-underline-offset: 3px; }
+
+  /* ---------- the boundary rule ---------- */
+
+  .rule-box {
+    background: var(--teal-soft);
+    border-left: 4px solid var(--teal);
+    padding: 20px 22px;
+    margin: 4px 0 26px;
+  }
+  .rule-box p { margin: 0; max-width: none; }
+  .rule-box .q {
+    font-family: var(--display);
+    font-weight: 700;
+    font-size: 18px;
+    line-height: 1.4;
+    margin-bottom: 8px;
+  }
+  .rule-box .src {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    color: var(--ink-2);
+    text-transform: uppercase;
+  }
+
+  /* ---------- diagram ---------- */
+
+  .diagram-scroll { overflow-x: auto; margin: 26px 0 10px; }
+  .diagram {
+    min-width: 640px;
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 0;
+    border: 1px solid var(--rule);
+    background: var(--surface);
+  }
+  .col-head {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    padding: 11px 14px;
+    background: var(--ink);
+    color: var(--paper);
+    border-right: 1px solid var(--rule);
+  }
+  .col-head:last-child { border-right: none; }
+  .cell {
+    padding: 15px 14px;
+    border-right: 1px solid var(--rule-soft);
+    border-top: 1px solid var(--rule-soft);
+    font-size: 13.5px;
+    line-height: 1.5;
+    color: var(--ink-2);
+  }
+  .cell:nth-child(3n) { border-right: none; }
+  .cell .what {
+    font-family: var(--display);
+    font-weight: 700;
+    font-size: 13.5px;
+    color: var(--ink);
+    display: block;
+    margin-bottom: 3px;
+  }
+  .cell.dim { color: var(--ink-3); background: var(--surface-2); }
+  .arrow {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--teal);
+    letter-spacing: 0.04em;
+    display: block;
+    margin-top: 6px;
+  }
+  .arrow.amber { color: var(--amber); }
+  figcaption {
+    font-size: 13px;
+    color: var(--ink-3);
+    font-style: italic;
+    max-width: 66ch;
+    margin-top: 2px;
+  }
+  figure { margin: 0; }
+
+  /* ---------- trigger cards ---------- */
+
+  .triggers {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+    margin: 22px 0;
+  }
+  .trigger { background: var(--surface); padding: 18px 18px 20px; }
+  .trigger .tag {
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--teal);
+  }
+  .trigger h4 {
+    font-family: var(--display);
+    font-weight: 700;
+    font-size: 16px;
+    margin: 7px 0 8px;
+  }
+  .trigger p { font-size: 14px; margin: 0 0 10px; color: var(--ink-2); }
+  .trigger pre { margin: 0; }
+
+  pre {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.55;
+    background: var(--surface-2);
+    border: 1px solid var(--rule-soft);
+    border-radius: 3px;
+    padding: 12px 13px;
+    overflow-x: auto;
+    color: var(--ink);
+    margin: 0 0 16px;
+  }
+  pre code { background: none; border: none; padding: 0; font-size: inherit; white-space: pre; }
+
+  /* ---------- the life of a link (a genuine sequence) ---------- */
+
+  ol.life { list-style: none; margin: 24px 0 8px; padding: 0; counter-reset: step; }
+  ol.life > li {
+    counter-increment: step;
+    display: grid;
+    grid-template-columns: 46px 1fr;
+    gap: 16px;
+    padding-block: 15px;
+    border-top: 1px solid var(--rule-soft);
+  }
+  ol.life > li::before {
+    content: counter(step, decimal-leading-zero);
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--teal);
+    padding-top: 3px;
+  }
+  ol.life .step-title {
+    font-family: var(--display);
+    font-weight: 700;
+    font-size: 15.5px;
+    margin-bottom: 2px;
+  }
+  ol.life .who {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin-bottom: 5px;
+  }
+  ol.life p { font-size: 14.5px; margin: 0; color: var(--ink-2); }
+  ol.life li.risk::before { color: var(--amber); }
+
+  /* ---------- tables ---------- */
+
+  .table-scroll { overflow-x: auto; margin: 20px 0 8px; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    min-width: 540px;
+    font-size: 13.5px;
+    background: var(--surface);
+  }
+  th {
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    text-align: left;
+    padding: 9px 12px;
+    border-bottom: 2px solid var(--ink);
+    color: var(--ink-2);
+    white-space: nowrap;
+  }
+  td {
+    padding: 11px 12px;
+    border-bottom: 1px solid var(--rule-soft);
+    vertical-align: top;
+    color: var(--ink-2);
+    line-height: 1.5;
+  }
+  td:first-child { color: var(--ink); }
+  td .m { white-space: nowrap; }
+  tbody tr:last-child td { border-bottom: none; }
+  .num-col { font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+  .pill {
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    padding: 2px 7px;
+    border-radius: 2px;
+    white-space: nowrap;
+  }
+  .pill.get  { background: var(--teal-soft); color: var(--teal); }
+  .pill.post { background: var(--amber-soft); color: var(--amber); }
+
+  /* ---------- incident ---------- */
+
+  .incident {
+    background: var(--flag-soft);
+    border: 1px solid var(--flag);
+    padding: 20px 22px;
+    margin: 22px 0;
+  }
+  .incident .label {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    color: var(--flag);
+    margin-bottom: 9px;
+  }
+  .incident p { margin: 0 0 12px; max-width: none; font-size: 15px; }
+  .incident p:last-child { margin-bottom: 0; }
+
+  .measure {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(152px, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+    margin: 22px 0;
+  }
+  .measure div { background: var(--surface); padding: 15px 16px; }
+  .measure .k {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin-bottom: 6px;
+  }
+  .measure .v {
+    font-family: var(--display);
+    font-weight: 900;
+    font-size: 25px;
+    line-height: 1.05;
+    letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums;
+  }
+  .measure .v.bad  { color: var(--flag); }
+  .measure .v.good { color: var(--pass); }
+  .measure .sub { font-size: 12px; color: var(--ink-3); margin-top: 4px; line-height: 1.4; }
+
+  /* ---------- supersede example ---------- */
+
+  .cases { margin: 20px 0 8px; border: 1px solid var(--rule); background: var(--surface); }
+  .case {
+    display: grid;
+    grid-template-columns: minmax(150px, 190px) 1fr;
+    gap: 14px;
+    padding: 13px 16px;
+    border-bottom: 1px solid var(--rule-soft);
+    align-items: baseline;
+  }
+  .case:last-child { border-bottom: none; }
+  .case .transition { font-family: var(--mono); font-size: 12.5px; color: var(--ink); white-space: nowrap; }
+  .case .outcome { font-size: 14px; color: var(--ink-2); }
+  .case .outcome b { color: var(--ink); font-weight: 600; font-family: var(--display); }
+
+  footer {
+    margin-top: 52px;
+    padding-top: 22px;
+    border-top: 3px solid var(--ink);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: 0.04em;
+    color: var(--ink-3);
+    line-height: 1.8;
+  }
+
+  @media (max-width: 560px) {
+    .case { grid-template-columns: 1fr; gap: 4px; }
+    ol.life > li { grid-template-columns: 34px 1fr; gap: 12px; }
+  }
+</style>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <p class="eyebrow">Architecture · POD_Verifier × sarathy</p>
+    <h1>Proof&#8209;of&#8209;Delivery Scoring</h1>
+    <p class="standfirst">Every delivery photo a rider uploads is scored by an EfficientNet model for whether it actually shows the parcel, at the door, legibly. Two services, one writer, and a set of deadlines built around the fact that the photo is usually not in S3 yet when we first look for it.</p>
+    <div class="byline">
+      <span><b>Scorer</b> POD_Verifier · AWS Lambda</span>
+      <span><b>Owner of record</b> sarathy · Spring Boot</span>
+      <span><b>Region</b> ap-south-1 (prod) · us-east-2 (stage)</span>
+    </div>
+  </header>
+
+  <section>
+    <h2><span class="num">01 — The boundary</span>Sarathy owns the data. The scorer owns the model.</h2>
+    <div class="rule-box">
+      <p class="q">“It is not a right thing to have 2 sources to modify the database belonging to a particular service.”</p>
+      <p class="src">The rule this architecture exists to satisfy</p>
+    </div>
+    <p>The Lambda used to hold credentials to sarathy's Postgres, run its own DDL and write <code>pod_scores</code> itself. It no longer carries a database driver at all — the image build fails if one reappears in <code>requirements.txt</code>. It asks sarathy what to score over HTTP and posts back what it found.</p>
+    <p>That makes sarathy the only writer to its own schema, and it puts every decision that depends on the data — which links already carry a score, which failures are due another attempt, which photos have been replaced — on the side that owns the data. The scorer decides one thing: what the image looks like.</p>
+    <p>The four <code>/internal/pod-scoring</code> endpoints are reachable only inside the VPC, over the internal NLB, with no app-level token. That is deliberate and it is why they are namespaced <code>/internal</code>: a public address would expose an unauthenticated write to <code>pod_scores</code>. <code>provision-stack.sh</code> refuses to deploy a <code>SARATHY_BASE_URL</code> that resolves publicly.</p>
+
+    <figure>
+      <div class="diagram-scroll">
+        <div class="diagram">
+          <div class="col-head">Rider app</div>
+          <div class="col-head">sarathy (Spring Boot)</div>
+          <div class="col-head">POD_Verifier (Lambda)</div>
+
+          <div class="cell">
+            <span class="what">Uploads photos to S3</span>
+            In the background, over whatever connection the rider has.
+          </div>
+          <div class="cell dim">—</div>
+          <div class="cell dim">—</div>
+
+          <div class="cell">
+            <span class="what">POST /app/save-info</span>
+            Announces the presigned URLs it generated.
+            <span class="arrow">→ URLs, not bytes</span>
+          </div>
+          <div class="cell">
+            <span class="what">trip.pod := the URLs</span>
+            Recorded verbatim. Nothing checks S3.
+          </div>
+          <div class="cell dim">—</div>
+
+          <div class="cell">
+            <span class="what">No OTP — asks for a check</span>
+            <code>/trip/send-pod-verification</code>. The trip stays open.
+          </div>
+          <div class="cell">
+            <span class="what">sendPodVerificationRequest</span>
+            <code>podVerificationStatus = REQUESTED</code>, TLs notified.
+            <span class="arrow">→ async invoke</span>
+          </div>
+          <div class="cell">
+            <span class="what">handle_single_trip</span>
+            A TL is waiting on this. Warm pool exists for it.
+          </div>
+
+          <div class="cell dim">TL approves or rejects</div>
+          <div class="cell">
+            <span class="what">verifyPod</span>
+            APPROVED / REJECTED. Refuses a trip already COMPLETED.
+          </div>
+          <div class="cell dim">—</div>
+
+          <div class="cell">
+            <span class="what">POST /app/complete</span>
+            On approval — or directly, when the rider has the OTP.
+          </div>
+          <div class="cell">
+            <span class="what">lmtripCompleteProcess</span>
+            Status → COMPLETED, <code>updated_at</code> stamped.
+            <span class="arrow">→ only if unscored</span>
+          </div>
+          <div class="cell">
+            <span class="what">handle_single_trip</span>
+            No-op if the request already scored it.
+          </div>
+
+          <div class="cell dim">—</div>
+          <div class="cell">
+            <span class="what">GET /trips?from=&amp;to=</span>
+            A keyset page of the last 26 hours.
+            <span class="arrow">← every 30 min</span>
+          </div>
+          <div class="cell">
+            <span class="what">handle_batch — the sweep</span>
+            Re-covers the day; nothing scored twice.
+          </div>
+
+          <div class="cell dim">—</div>
+          <div class="cell">
+            <span class="what">GET /retry-links</span>
+            Links whose download failed and are due again.
+            <span class="arrow amber">← second pass</span>
+          </div>
+          <div class="cell">
+            <span class="what">run_retry_pass</span>
+            The photo that had not landed yet.
+          </div>
+
+          <div class="cell dim">—</div>
+          <div class="cell">
+            <span class="what">POST /scores</span>
+            Upsert, then reconcile replaced links.
+            <span class="arrow">← results</span>
+          </div>
+          <div class="cell">
+            <span class="what">write_scores</span>
+            One call per batch.
+          </div>
+        </div>
+      </div>
+      <figcaption>Every arrow crossing into column two is HTTP. Nothing crosses into the database except from column two.</figcaption>
+    </figure>
+  </section>
+
+  <section>
+    <h2><span class="num">02 — Entry points</span>Three ways in, one scoring path</h2>
+    <p class="lede">All three converge on <code>score_and_record</code>: download a window of images concurrently, run inference in batches, post every outcome back. A failed download is recorded as a row, never dropped.</p>
+
+    <div class="triggers">
+      <div class="trigger">
+        <div class="tag">Per trip · two call sites</div>
+        <h4>One trip, immediately</h4>
+        <p>Sarathy invokes asynchronously from two places, in order: a <strong>POD verification request</strong> while the trip is still open and a TL is about to judge it, then <strong>completion</strong>. Neither fires when every link already carries a score. Latency-sensitive — this is why containers are kept warm.</p>
+        <pre><code>{"trip_id": 50645055,
+ "pod_links": ["https://…"],
+ "source": "sarathy.sendPodVerif…"}</code></pre>
+      </div>
+      <div class="trigger">
+        <div class="tag">Scheduled · every 30 min</div>
+        <h4>The sweep</h4>
+        <p>An empty event scores everything updated in the last 26 hours, then runs the retry pass. Idempotent, so a run that fails is simply re-covered by the next one.</p>
+        <pre><code>{}</code></pre>
+      </div>
+      <div class="trigger">
+        <div class="tag">Manual</div>
+        <h4>Backfill / forced retry</h4>
+        <p>Named dates score exactly those days and skip the retry pass. The retry event reaches links the schedule can no longer see — past the cutoff, or out of attempts.</p>
+        <pre><code>{"start_date": "2026-09-01",
+ "end_date":   "2026-09-09"}
+
+{"retry_failed": {"since": "…"}}</code></pre>
+      </div>
+    </div>
+
+    <h3>Verification comes first, and that is the score that matters</h3>
+    <p>The POD verification flow exists because <strong>a rider without the delivery OTP cannot close the trip themselves</strong>. They upload the photo, raise a request, and a TL approves or rejects it — and only then does the app call <code>/app/complete</code>. <code>verifyPod</code> states the ordering in code by refusing outright when the trip is already <code>COMPLETED</code>.</p>
+    <p>So the verification request is the <strong>latency-critical</strong> score: the trip is still open, a person is about to make an approve/reject call, and the point is that the model's opinion is on screen when they do. That is what the warm pool is for.</p>
+    <p>Completion is the later, quieter trigger, and it carries two jobs. It is the <em>only</em> per-trip score for the ordinary flow, where the rider has the OTP and never raises a request at all. And in the verification flow it is normally a no-op — the request already scored these links — firing only when the POD changed in between, which is exactly the case of a TL rejecting and the rider re-uploading.</p>
+    <p>Sarathy checks before it invokes: if every link it would send already carries a score, it skips the call rather than spending an invocation to be told so. The check runs through the same <code>tripForScoring</code> the Lambda itself would consult, so the two cannot disagree about what “already scored” means. It deliberately fails <em>open</em> — any doubt and the invoke goes out, because scoring twice costs one invocation and an idempotent upsert, while not scoring at all costs a photo nobody ever looked at.</p>
+
+    <h3>What the sweep covers, and what it doesn’t</h3>
+    <p>The sweep selects on <code>status = 'COMPLETED'</code>. For completed trips it is a complete safety net — a dropped, throttled or Lambda-down invoke costs nothing but half an hour — which is why both per-trip call sites swallow their failures without touching the rider's response. Eight code paths set a trip to COMPLETED and only <code>lmtripCompleteProcess</code> invokes; the rest are pickup placeholders and tour closures that carry no photo.</p>
+    <p><strong>A trip sitting in REQUESTED is outside that net.</strong> It is still open, so the sweep cannot see it, and the verification-request invoke is the only thing that will score it before it closes. Losing that invoke loses nothing permanently — completion or the sweep picks it up afterwards — but the TL decides without a score, and that failure shows up as a worse decision rather than as a missing row.</p>
+
+    <h3>Why the sweep window is 26 hours and not “today”</h3>
+    <p>A run at 23:30 asking for today covers up to 23:30. Every trip completing between then and midnight would fall into no run at all, because the next day's runs look at the next day's timestamps. A rolling window longer than a day has no such seam, costs nothing extra — sarathy reports which links already carry a score — and re-covers any run that failed or was throttled.</p>
+
+    <h3>Why the window is on <code>updated_at</code> and not <code>closed_at</code></h3>
+    <p>Two reasons. <code>Trip.onUpdate()</code> is a <code>@PreUpdate</code> callback, and completing a trip is an UPDATE, so a trip that completed inside the window necessarily carries an <code>updated_at</code> inside it — the guarantee is structural rather than a convention each of the eight call sites has to remember. And a POD can be <em>replaced</em> after completion: <code>FmMmTourTripService.completeTrip</code>'s already-COMPLETED branch writes new URLs and bumps <code>updatedAt</code> while deliberately leaving <code>closedAt</code> alone. A <code>closed_at</code> window would never look at that trip again.</p>
+  </section>
+
+  <section>
+    <h2><span class="num">03 — The sequence</span>The life of one POD link</h2>
+    <p class="lede">This is a real sequence and the ordering carries the design. Steps 04 and 07 are where the system's two genuine hazards live.</p>
+
+    <ol class="life">
+      <li>
+        <div>
+          <div class="step-title">The rider finishes a delivery</div>
+          <div class="who">Rider app</div>
+          <p>Photos are queued for background upload to S3 and presigned URLs are generated locally.</p>
+        </div>
+      </li>
+      <li>
+        <div>
+          <div class="step-title">The app announces the URLs</div>
+          <div class="who">Rider app → sarathy · POST /app/save-info</div>
+          <p><code>SpmdTripService.tripInfoPopulator</code> writes <code>trip.pod</code> from the request body verbatim. The server never touches S3 and never checks that the object exists.</p>
+        </div>
+      </li>
+      <li>
+        <div>
+          <div class="step-title">No OTP: the rider asks a TL to check the photo</div>
+          <div class="who">sarathy · POST /trip/send-pod-verification</div>
+          <p><code>podVerificationStatus = REQUESTED</code>, TLs are notified, and the scorer is invoked. The trip is <em>still open</em> — the sweep cannot see it — so this invoke is the only thing that scores it before the TL decides.</p>
+        </div>
+      </li>
+      <li>
+        <div>
+          <div class="step-title">The trip completes</div>
+          <div class="who">sarathy · POST /app/complete</div>
+          <p>Called on TL approval, or directly when the rider had the OTP all along. <code>updated_at</code> is stamped and the trip enters the sweep's window. A per-trip invoke fires too — unless every link already carries a score, which in the verification flow it usually does.</p>
+        </div>
+      </li>
+      <li class="risk">
+        <div>
+          <div class="step-title">The scorer asks S3 for the image — and it may not be there</div>
+          <div class="who">Lambda · the upload race</div>
+          <p>A 403, a 404 or a suspiciously short body almost always means the upload is still in flight, not that the link is dead. The download retries in place at <strong>+5s then +15s</strong>, bounded by the invocation's deadline. A timeout or a 5xx is <em>not</em> retried here — that is the host being unwell, and the HTTP adapter already handles it at the socket level.</p>
+        </div>
+      </li>
+      <li>
+        <div>
+          <div class="step-title">Inference</div>
+          <div class="who">Lambda · EfficientNet, four heads</div>
+          <p><code>context_valid</code>, <code>package_visible</code>, <code>label_readable</code>, <code>image_clarity</code>, combined by fixed weights into <code>pod_score</code>. ImageNet normalization is mandatory — it is the correctness fix the model was retrained around.</p>
+        </div>
+      </li>
+      <li>
+        <div>
+          <div class="step-title">Results are upserted</div>
+          <div class="who">Lambda → sarathy · POST /scores</div>
+          <p>Idempotent on <code>(awb, pod_link, run_date)</code>, so a retried invocation updates rather than duplicating. A success clears the retry schedule; a failure advances it.</p>
+        </div>
+      </li>
+      <li class="risk">
+        <div>
+          <div class="step-title">Replaced photos are retired</div>
+          <div class="who">sarathy · supersede reconciliation</div>
+          <p>The same write reconciles each named trip against its current <code>trip.pod</code>. Any score row whose link is no longer part of the POD is stamped <code>superseded_at</code> and drops out of <code>pod_scores_flagged</code>.</p>
+        </div>
+      </li>
+      <li>
+        <div>
+          <div class="step-title">Anything still missing comes back round</div>
+          <div class="who">sarathy schedule · Lambda retry pass</div>
+          <p>Attempts at +30m, 1h, 2h, 4h, 8h, 16h, stopping 24 hours after the first failure — which is when the app's own background upload task abandons the image, so past that point nothing is left to arrive.</p>
+        </div>
+      </li>
+    </ol>
+  </section>
+
+  <section>
+    <h2><span class="num">04 — The upload race</span>Most “failures” are a photo that hadn’t landed yet</h2>
+    <p><code>trip.pod</code> is filled from URLs the client generated, at the moment the client said so. The bytes follow on the rider's connection. Essentially every <code>download_failed</code> row in <code>pod_scores</code> is that gap, which is why the system treats a failure as a schedule rather than a verdict.</p>
+
+    <p>A flat 5–10 second sleep on every invocation was considered and rejected: it would pay the wait for the ~90% of images already present, and delay every rider's answer to help the few that are not. Retrying only the links that actually miss costs nothing in the healthy case.</p>
+
+    <h3>Bounding it by attempts, not by age</h3>
+    <p>An uncapped retry set grows without limit — a few hundred permanently dead links a day becomes six figures within a year, and every 30-minute run would try all of them. Bounding by attempt count with widening gaps keeps the cost flat while still giving a slow upload most of a day to arrive.</p>
+
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th>Attempt</th><th>Scheduled at</th><th class="num-col">Elapsed</th><th>What it means</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1</td><td>immediately, in the invocation</td><td class="num-col">0s / +5s / +15s</td><td>The common case: a few seconds behind.</td></tr>
+          <tr><td>2</td><td>+30 minutes</td><td class="num-col">30m</td><td>Next sweep.</td></tr>
+          <tr><td>3</td><td>+1 hour</td><td class="num-col">1.5h</td><td>Slow connection, large images.</td></tr>
+          <tr><td>4</td><td>+2 hours</td><td class="num-col">3.5h</td><td rowspan="3">Rider offline, phone asleep, app backgrounded.</td></tr>
+          <tr><td>5</td><td>+4 hours</td><td class="num-col">7.5h</td></tr>
+          <tr><td>6</td><td>+8 hours</td><td class="num-col">15.5h</td></tr>
+          <tr><td>—</td><td>cutoff at 24h from first failure</td><td class="num-col">24h</td><td>The app abandons the upload here too.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p style="margin-top:18px;">Each sweep logs what recovered and how long it had been waiting, bucketed. That histogram is the evidence that would justify shortening the window — if every recovery lands inside the first hour, the tail is spending S3 requests for nothing.</p>
+    <pre><code>POD retry sweep: attempted=412 recovered=96 still_failed=316 force=false
+POD retry recovery by age since first failure (96 recovered in last 24h):
+  &lt;30m=51 30m-1h=22 1-2h=13 2-4h=6 4-8h=3 8-16h=1 16-24h=0</code></pre>
+  </section>
+
+  <section>
+    <h2><span class="num">05 — Replaced photos</span>Superseding, per link and never per trip</h2>
+    <p><code>/app/save-info</code> replaces <code>trip.pod</code> wholesale, so a re-upload leaves the previous link's row behind. <code>pod_scores_flagged</code> takes <code>MAX(pod_score)</code> across every row for an <code>(awb, run_date)</code> — so a rider who replaced a good photo with a bad one still read <strong>PASS</strong>, decided by an image that is no longer the POD.</p>
+    <p>A row is superseded if and only if its link is absent from the trip's current POD. Nothing about the trip having been updated retires anything by itself, which is what makes the common additive re-upload safe.</p>
+
+    <div class="cases">
+      <div class="case">
+        <div class="transition">[A, B] → [A, B, C]</div>
+        <div class="outcome"><b>Nothing retired.</b> A and B are still the POD; C is simply new.</div>
+      </div>
+      <div class="case">
+        <div class="transition">[A, B] → [C, D]</div>
+        <div class="outcome"><b>A and B retired.</b> A full replacement.</div>
+      </div>
+      <div class="case">
+        <div class="transition">[A, B] → [A, C]</div>
+        <div class="outcome"><b>B retired only.</b> A survives untouched, C is new.</div>
+      </div>
+      <div class="case">
+        <div class="transition">[A, B] → [A, B]</div>
+        <div class="outcome"><b>Nothing retired, nothing inserted.</b> The upsert just refreshes the rows.</div>
+      </div>
+    </div>
+
+    <p style="margin-top:18px;">The current link set is read from the database at write time, not taken from the scorer's payload — the payload can be seconds stale, having been built before a re-upload that has since landed.</p>
+  </section>
+
+  <section>
+    <h2><span class="num">06 — The incident</span>Why the reads look the way they do</h2>
+
+    <div class="incident">
+      <div class="label">Production · every run, silently</div>
+      <p>The first version of the sweep filtered on <code>COALESCE(closed_at, updated_at)</code> and paginated on <code>trip_id</code>. Filtering one column and ordering by another cannot be served by an index, so the planner walked the primary key upward from the lowest trip id, testing each row. Production ids are past 50.7 million and the wanted rows are all at the top.</p>
+      <p>Every run hit <code>statement_timeout</code> — SQLState <strong>57014</strong> — on all four of the scorer's attempts, every thirty minutes, having scored nothing. It was never seen in staging, where the trip table is small enough that walking it is instant.</p>
+      <p>The expression could not have been indexed either: <code>closed_at</code> is <code>timestamp</code> and <code>updated_at</code> is <code>timestamptz</code>, so the COALESCE resolves through an implicit cast that reads the session TimeZone — making it STABLE, and Postgres will not index a non-immutable expression.</p>
+    </div>
+
+    <p>The fix filters and orders on the same tuple, <code>(updated_at, trip_id)</code>, compared as a row value. It needs <strong>no new index</strong> — <code>trip.updated_at</code> is already indexed, which a planner probe through the Metabase FDW confirmed before a line was written.</p>
+
+    <div class="measure">
+      <div>
+        <div class="k">Before · seeded 2M rows</div>
+        <div class="v bad">104 ms</div>
+        <div class="sub">Parallel seq scan, 14,769 buffers. In production: timeout.</div>
+      </div>
+      <div>
+        <div class="k">After · same table</div>
+        <div class="v good">0.89 ms</div>
+        <div class="sub">Index scan + incremental sort, 1,142 buffers.</div>
+      </div>
+      <div>
+        <div class="k">Paging walk</div>
+        <div class="v good">72 pages</div>
+        <div class="sub">35,656 rows, 35,656 distinct. No gaps, no repeats.</div>
+      </div>
+      <div>
+        <div class="k">Same walk, millisecond cursor</div>
+        <div class="v bad">∞</div>
+        <div class="sub">201 pages at the cap, 40,255 seen, 35,656 distinct.</div>
+      </div>
+    </div>
+
+    <h3>The cursor carries microseconds</h3>
+    <p>Postgres timestamps resolve to microseconds. A cursor truncated to milliseconds compares <em>below</em> the row it came from, so that row is served again — and a page whose rows all share one millisecond never advances the cursor at all. The fourth measurement above is that loop, reproduced on a table seeded so thousands of trips share a millisecond, as production does. The token is opaque to the scorer: echo it back, never parse it.</p>
+  </section>
+
+  <section>
+    <h2><span class="num">07 — Interfaces</span>Four endpoints, one table</h2>
+
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th>Endpoint</th><th>Called by</th><th>What it does</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><span class="pill get">GET</span> <span class="m">/trips/{tripId}</span></td>
+            <td>Per-trip path</td>
+            <td>One trip's links plus which already carry a score. Empty <code>podLinks</code> is a 200 — a request can be raised before the photo lands.</td>
+          </tr>
+          <tr>
+            <td><span class="pill get">GET</span> <span class="m">/trips</span></td>
+            <td>Sweep, backfill</td>
+            <td>A keyset page of trips in a window. <code>from</code>/<code>to</code> are instants (sweep); <code>startDate</code>/<code>endDate</code> are whole days, end inclusive (backfill).</td>
+          </tr>
+          <tr>
+            <td><span class="pill get">GET</span> <span class="m">/retry-links</span></td>
+            <td>Retry pass</td>
+            <td>Links due another download attempt. <code>force=true</code> with <code>since</code>/<code>until</code> ignores the schedule entirely.</td>
+          </tr>
+          <tr>
+            <td><span class="pill post">POST</span> <span class="m">/scores</span></td>
+            <td>All paths</td>
+            <td>Upsert a batch, then reconcile the named trips against their current POD.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3><code>pod_scores</code></h3>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th>Column</th><th>Role</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><span class="m">awb, trip_id, pod_link</span></td><td>Identity. <code>trip_id</code> is <code>INTEGER</code>, matching <code>trip.trip_id</code>.</td></tr>
+          <tr><td><span class="m">run_date</span></td><td>Third part of the upsert key <code>(awb, pod_link, run_date)</code>.</td></tr>
+          <tr><td><span class="m">pod_score</span> + four probs</td><td>The model's output. Null unless <code>status='scored'</code>.</td></tr>
+          <tr><td><span class="m">status, failure_reason</span></td><td><code>scored</code> or <code>download_failed</code>.</td></tr>
+          <tr><td><span class="m">attempts, first_failed_at, next_retry_at</span></td><td>The retry schedule. A success clears <code>next_retry_at</code>; the row leaves the partial index.</td></tr>
+          <tr><td><span class="m">superseded_at</span></td><td>Set when the link is no longer part of the trip's POD. Excluded from the flagged view.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="margin-top:18px;"><code>pod_scores_flagged</code> ranks the top three images per <code>(awb, run_date)</code> and calls <strong>PASS</strong> above <code>0.7</code>, <strong>FLAG</strong> below. Download failures are excluded from the decision by design — a fetch that failed is our problem, not the rider's, and an AWB is never flagged for it.</p>
+  </section>
+
+  <section>
+    <h2><span class="num">08 — Operating notes</span>Deploying, tuning, watching</h2>
+
+    <h3>Order matters</h3>
+    <p>Sarathy first, with its migration and API in the same artifact, then the Lambda — the scorer calls <code>/retry-links</code>, which does not exist until sarathy ships. Keep the EventBridge schedule disabled until both sides are up. <code>SARATHY_BASE_URL</code> must be set in the CircleCI context and must not resolve publicly.</p>
+
+    <h3>Dials worth knowing</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Setting</th><th class="num-col">Default</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td><span class="m">SWEEP_LOOKBACK_HOURS</span></td><td class="num-col">26</td><td>Must stay above 24 or the midnight seam reopens.</td></tr>
+          <tr><td><span class="m">DOWNLOAD_RETRY_DELAYS</span></td><td class="num-col">5,15</td><td>In-invocation waits for a photo still uploading.</td></tr>
+          <tr><td><span class="m">pod.scoring.retry-window-hours</span></td><td class="num-col">24</td><td>How long a failed link stays worth retrying.</td></tr>
+          <tr><td><span class="m">pod.scoring.rescore-lookback-days</span></td><td class="num-col">30</td><td>How long a score suppresses a re-download.</td></tr>
+          <tr><td><span class="m">FLAG_THRESHOLD</span></td><td class="num-col">0.7</td><td>Evaluation favours 0.55–0.60 for precision-first penalising. Change it here <em>and</em> in the view.</td></tr>
+          <tr><td><span class="m">IMAGENET_NORMALIZE</span></td><td class="num-col">true</td><td>Required. The model was trained with it; do not disable.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>What to watch</h3>
+    <p>CloudWatch namespace <code>PODPipeline</code> carries <code>ImagesScored</code>, <code>ImagesFailed</code> and <code>ImagesUncovered</code>; uncovered should be zero, since every input gets an outcome. In the logs, the sweep's <code>recovered</code> against <code>attempted</code> says whether retrying is earning its keep, and the recovery histogram says whether 24 hours is the right cutoff. A run reporting <code>continuing</code> queued a bounded continuation and will resume itself.</p>
+
+    <h3>Known limits</h3>
+    <p>A POD replaced more than 26 hours after the trip was last updated needs a manual <code>retry_failed</code> event. A link that only lands after the 24-hour cutoff is never scored automatically. Neither is a bug; both are the deliberate edge of a bounded system, and both are reachable by hand.</p>
+  </section>
+
+  <footer>
+    POD_Verifier · aws/lambda_scorer — handler.py, sarathy_client.py<br>
+    sarathy · PodScoringApi, PodScoringApiService, PodScoreRepository, V200__pod_scores_retry_supersede_tripid.sql<br>
+    86 tests on the sarathy side · 146 tests and 100% coverage on the scorer
+  </footer>
+
+</div>
