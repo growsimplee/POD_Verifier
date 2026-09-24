@@ -120,6 +120,20 @@ Parameters:
     Default: "800"
     Description: Images held in memory per window (bounds peak memory)
 
+  DownloadRetryDelays:
+    Type: String
+    Default: ""
+    Description: >
+      Comma-separated seconds to wait before re-fetching a POD link that came
+      back 403 (i.e. the rider's upload has not landed yet). EMPTY ON PURPOSE.
+      Measured in production on 2026-09-24: these uploads land hours to days
+      later -- a forced retry recovered 10,263 of 10,270 links that had been
+      failing for up to nine days, all on the first fetch -- so an in-line wait
+      cannot succeed, while it cost the sweep its whole budget (one 403 in a
+      one-image window sleeps 20s with no concurrency to hide it). The
+      scheduled retry pass is what recovers these. Set to "5,15" to restore the
+      previous behaviour.
+
   ImagenetNormalize:
     Type: String
     Default: "true"
@@ -248,6 +262,7 @@ Resources:
           FLAG_THRESHOLD: !Ref FlagThreshold
           MAX_DOWNLOAD_WORKERS: !Ref MaxDownloadWorkers
           WINDOW_SIZE: !Ref WindowSize
+          DOWNLOAD_RETRY_DELAYS: !Ref DownloadRetryDelays
           INFERENCE_BATCH_SIZE: !Ref InferenceBatchSize
           IMAGENET_NORMALIZE: !Ref ImagenetNormalize
           CONTINUATION_SAFETY_MS: "90000"
